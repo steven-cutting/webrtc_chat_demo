@@ -21,7 +21,7 @@ into the first and click **Accept answer**. Both tabs show `channel:open`. Type.
 | --- | --- |
 | `npm run dev` | Vite on `0.0.0.0:5173` (`--strictPort`, so a port collision is loud) |
 | `npm run typecheck` | `tsc --noEmit` over `src/`, `e2e/`, `playwright.config.ts` |
-| `npm run test:e2e` | Playwright: two contexts, full handshake, byte-identity both ways |
+| `npm run test:e2e` | Playwright, two projects (bundled Chromium, and Google Chrome via `channel`) on **stock launch args**, so mDNS obfuscation stays on: `handshake.spec.ts` runs the full two-context handshake and asserts byte-identity both ways; `ice-timeout.spec.ts` drives the gathering-timeout path against a black-holed STUN/TURN address (~50 s total, mostly one deliberate 40 s back-off). Add `--project=chromium` if Chrome is not installed |
 | `npm run build` | Production bundle (nothing here is deployed; this is just a gate) |
 
 ## The handshake
@@ -57,8 +57,11 @@ into the first and click **Accept answer**. Both tabs show `channel:open`. Type.
 
 1. **`createDataChannel()` before `createOffer()`.** The channel is what emits the
    `m=application` section. Reverse the order and the answerer's `datachannel` event
-   never fires, no ICE transport is created, and `iceGatheringState` stays `new`
-   forever — while *both sides still report `connectionState: 'connected'`*.
+   never fires and no ICE transport is created, so the offer carries **zero**
+   candidates and both peers sit at `gathering:new · ice:new · conn:new` forever —
+   nothing was ever created that could transition. Measured in Chromium 151; the
+   diagnostics strip shows that whole signature, which is how you tell it apart from
+   a network problem.
 2. **Serialize `pc.localDescription`, not the `createOffer()` return value.** That
    returned object is a frozen snapshot with **zero** candidates. The browser merges
    candidates into `localDescription.sdp` as it surfaces them, so you must re-read it
@@ -96,21 +99,37 @@ the receiving device's wire log.
 
 The diagnostics strip and the wire log say why:
 
-- **All host candidates end in `.local`** — they are mDNS-obfuscated and your network
-  is blocking multicast. Guest VLANs and APs with client isolation do this; mDNS is one
-  hop and never crosses subnets.
+- **All host candidates end in `.local`** — this on its own is **normal, not a fault**.
+  Chrome obfuscates host candidates with mDNS by default for any origin that does not
+  hold camera/microphone permission, so you will see it on every healthy run too
+  (measured here: `.local` candidates present in 100% of runs that connected fine).
+  It only implicates multicast when it appears *together with* `ice → failed`. If it
+  does, then suspect the network: guest VLANs and APs with client isolation block
+  mDNS, which is one hop and never crosses subnets. On macOS, suspect the OS first
+  (see below).
 - **Zero `srflx` candidates** — STUN is unreachable from this network.
 - **Both** — there is no path, and with TURN out of scope nothing here can fix it.
 - **`conn → failed`** — press **Reset** in both tabs and redo the exchange. Session
   descriptions are single-use; a stale blob cannot be re-pasted.
 - **macOS: `conn → failed` with all-`.local` candidates, even between two tabs of the
-  same browser** — grant Chrome **Local Network** access in System Settings → Privacy &
-  Security → Local Network. Without it Chrome cannot resolve mDNS candidates at all.
-  Origin-scoped alternative, no System Settings needed: allow camera + microphone for
-  `http://localhost:5173` in `chrome://settings/content` — Chrome skips mDNS
-  obfuscation for origins that hold media-capture permission.
-  (Observed on macOS 26: Chrome.app failed this way while Playwright's bundled Chromium,
-  on the same machine and the same page, connected fine.)
+  same browser** — try granting Chrome **Local Network** access in System Settings →
+  Privacy & Security → Local Network; without it Chrome may be unable to resolve mDNS
+  candidates. Origin-scoped alternative, no System Settings needed: allow camera +
+  microphone for `http://localhost:5173` in `chrome://settings/content`, since Chrome
+  skips mDNS obfuscation for origins holding media-capture permission (mechanism is
+  consistent with Chromium's design; not exercised by anything in this repo, and
+  **localhost only** — media-capture permission needs a secure context, so it is
+  unavailable on the `http://<lan-ip>:5173` origin the phone uses).
+  Calibration before you spend time here: this failure did **not** reproduce under
+  automation. Driving the full handshake with mDNS obfuscation left on, Google Chrome
+  152 from `/Applications` and bundled Chromium 151 both reached `channel:open` in
+  under 300 ms, with `.local` candidates on both sides. The caveat that keeps this
+  from being conclusive: Playwright launches Chrome with a fresh temporary profile,
+  and macOS attributes Local Network permission to the *responsible process*, which
+  for a terminal-spawned browser may be the terminal rather than Chrome.app — so a
+  Dock-launched Chrome can still differ. Treat Local Network permission as one
+  hypothesis, not the diagnosis, and confirm in `chrome://webrtc-internals` before
+  changing OS settings.
 
 `chrome://webrtc-internals` is the confirming second opinion.
 

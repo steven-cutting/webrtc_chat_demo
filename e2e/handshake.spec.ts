@@ -38,13 +38,19 @@ test('typed JSON envelopes cross the data channel, byte for byte', async ({ brow
 
   const offer = await A.getByTestId('local-blob').inputValue();
 
-  // 2. The mDNS canary: asserts the launch flag is actually in effect. Without
-  //    it the run silently depends on host multicast-DNS resolution, which
-  //    works on some machines and not others -- so this fails fast and names
-  //    its own fix rather than leaving a machine-dependent test behind.
-  expect(offer, 'mDNS not disabled — see launchOptions.args in playwright.config.ts').not.toContain('.local');
+  // 2. Candidate assertions about the APP, not about the harness. mDNS
+  //    obfuscation is a Chrome DEFAULT, not a fault -- both projects run with it
+  //    on -- so '.local' host candidates are expected and asserting their
+  //    absence would only have asserted a launch flag. What must actually hold
+  //    is that countCandidates() reads the SDP correctly: the app's mDNS notice
+  //    fires if and only if a candidate address really ends in .local.
+  //    Note the blob is JSON, so its SDP newlines are the two characters \r\n;
+  //    match on the escaped text, never with a multiline anchor.
   expect(offer).toMatch(/typ host/);
   expect(offer, 'offer has no data channel section — was createDataChannel called before createOffer?').toContain('m=application');
+  const mdnsInSdp = /a=candidate:[^ ]+ [^ ]+ [^ ]+ [^ ]+ [^ ]+\.local /.test(offer);
+  const mdnsNoticed = (await A.getByTestId('wire-log').innerText()).includes('mDNS-obfuscated');
+  expect(mdnsNoticed, "the app's mDNS notice disagrees with the candidates it published").toBe(mdnsInSdp);
 
   // 3. The rollback guard. A pastes its OWN offer back. This asserts the
   //    ABSENCE of the implicit rollback the W3C spec obliges the browser to

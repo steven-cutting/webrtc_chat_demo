@@ -6,12 +6,20 @@ type Phase =
   | 'idle' | 'gathering' | 'offer-ready' | 'answer-ready'
   | 'connecting' | 'connected' | 'closed';
 
+// Measured on this host: with a reachable STUN server gathering reaches
+// 'complete' in ~125 ms, and every candidate has landed by ~250 ms in every
+// configuration tried. With a black-holed STUN server Chrome keeps retrying and
+// only completes at ~39.9 s -- with a candidate set identical to the one it
+// already had at 3 s. So 3000 ms costs nothing when STUN works and saves ~37 s
+// of dead waiting when it does not.
 const ICE_GATHER_TIMEOUT_MS = 3000;
 
 let phase: Phase = 'idle';
 let role: Role | null = null;
 let dc: RTCDataChannel | null = null;
 let seq = 0;
+/** True while the published blob is the partial snapshot taken at the gathering timeout. */
+let provisional = false;
 
 const el = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -97,9 +105,10 @@ async function startOffer(): Promise<void> {
   try {
     // The data channel MUST be created before createOffer(): it is what emits
     // the m=application section. Create it after, and the answerer's
-    // `datachannel` event never fires, no ICE transport is created, and
-    // iceGatheringState stays 'new' forever -- while both sides still report
-    // connectionState 'connected'. Most confusing failure in WebRTC.
+    // `datachannel` event never fires and no ICE transport is created, so the
+    // offer carries zero candidates and BOTH peers sit at gathering:new ·
+    // ice:new · conn:new forever -- nothing was ever created that could
+    // transition. Measured in Chromium 151; the strip shows the whole signature.
     attach(pc.createDataChannel('chat'));
     await pc.setLocalDescription(await pc.createOffer()); // gathering starts HERE
   } catch (err) {
@@ -217,8 +226,10 @@ function waitForIce(timeoutMs = ICE_GATHER_TIMEOUT_MS): Promise<{ timedOut: bool
     const onChange = (): void => {
       if (pc.iceGatheringState === 'complete') done(false);
     };
-    // Firefox bug 1297158 is still open: with a dead STUN server 'complete' can
-    // never arrive, so the timeout is not optional.
+    // The timeout is not optional. Firefox bug 1297158 is still open: with a
+    // dead STUN server 'complete' can never arrive at all. Chrome does complete,
+    // but only after ~39.9 s of STUN retransmits (measured) -- far too long to
+    // hold the blob back for, since the candidates are already there.
     const timer = setTimeout(() => done(true), timeoutMs);
     pc.addEventListener('icegatheringstatechange', onChange);
   });
@@ -226,25 +237,54 @@ function waitForIce(timeoutMs = ICE_GATHER_TIMEOUT_MS): Promise<{ timedOut: bool
 
 async function gatherAndPublish(ready: Phase): Promise<void> {
   const { timedOut } = await waitForIce();
-  if (timedOut) {
-    // Not an error: candidates gathered so far are already in
-    // localDescription.sdp; only the trailing a=end-of-candidates is missing.
-    const { total } = countCandidates(pc.localDescription?.sdp ?? '');
-    log('event', `ice gathering timed out — publishing the ${total} candidates gathered so far`);
+  if (!timedOut) {
+    setPhase(ready);
+    publish();
+    return;
   }
+
+  // Gathering is still running. Registered before publish() so the refresh path
+  // reads in the order it happens.
+  provisional = true;
+  const onComplete = (): void => {
+    if (pc.iceGatheringState !== 'complete') return;
+    pc.removeEventListener('icegatheringstatechange', onComplete);
+    provisional = false;
+    // Only refresh while the provisional blob is still the one the operator is
+    // copying from. 'gathering' is the zero-candidate case below recovering;
+    // any later phase means the peer already consumed the blob, and rewriting
+    // 'offer-ready' over a live session would re-enable Accept, re-log "copy
+    // again" and wipe a Connection failed message off the screen.
+    if (phase !== ready && phase !== 'gathering') {
+      renderBlobMeta(); // drop the PARTIAL marker from a blob that is now spent
+      return;
+    }
+    if (phase === 'gathering') clearError();
+    setPhase(ready);
+    publish();
+    log('event', 'gathering finished — the blob above is complete now, copy it again');
+  };
+  pc.addEventListener('icegatheringstatechange', onComplete);
+  onComplete(); // the same synchronous re-check waitForIce does, for the same reason
+  if (!provisional) return;
+
+  // What can be missing here is CANDIDATES, not merely a trailing
+  // a=end-of-candidates: Chrome never writes that line into localDescription.sdp
+  // even once gathering completes, so its absence signals nothing either way.
+  const { total } = countCandidates(pc.localDescription?.sdp ?? '');
+  log('event', `ice gathering still running after ${ICE_GATHER_TIMEOUT_MS} ms — ${total} candidate${total === 1 ? '' : 's'} so far`);
+
+  if (total === 0) {
+    // A description with no candidates can never form a candidate pair. Calling
+    // it 'ready' hands the operator a blob that is guaranteed to fail, so stay
+    // in 'gathering' -- where every control is already disabled -- and say so.
+    // If gathering finishes later, onComplete above still recovers the flow.
+    fail('No ICE candidates yet, so there is nothing to copy. If none arrive, press Reset and check the network.');
+    return;
+  }
+
   setPhase(ready);
   publish();
-
-  if (timedOut) {
-    const late = (): void => {
-      if (pc.iceGatheringState !== 'complete') return;
-      pc.removeEventListener('icegatheringstatechange', late);
-      if (phase !== ready) return;
-      publish();
-      log('event', 'blob refreshed — copy again');
-    };
-    pc.addEventListener('icegatheringstatechange', late);
-  }
 }
 
 function publish(): void {
@@ -255,12 +295,24 @@ function publish(): void {
   ui.localBlob.value = blob;
 
   const c = countCandidates(pc.localDescription?.sdp ?? '');
-  ui.blobMeta.textContent = `${blob.length.toLocaleString()} chars · ${c.summary}`;
+  renderBlobMeta();
   log('event', `${pc.localDescription?.type} published — ${blob.length} chars, ${c.summary}`);
   if (c.mdns) {
     log('event', 'host candidates are mDNS-obfuscated — the peer must resolve them over multicast DNS');
   }
   render();
+}
+
+/**
+ * The line under the Copy button. Separate from publish() so the PARTIAL marker
+ * can be cleared without re-logging a publish that did not happen. The wire log
+ * scrolls; this sits where the operator is looking when they decide to copy.
+ */
+function renderBlobMeta(): void {
+  const blob = ui.localBlob.value;
+  const c = countCandidates(pc.localDescription?.sdp ?? '');
+  const partial = provisional ? ' · PARTIAL — still gathering, copy again when this clears' : '';
+  ui.blobMeta.textContent = `${blob.length.toLocaleString()} chars · ${c.summary}${partial}`;
 }
 
 /** Read-only: counts a=candidate lines. Never modifies the SDP. */

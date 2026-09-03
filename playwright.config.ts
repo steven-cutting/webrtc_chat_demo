@@ -11,20 +11,27 @@ export default defineConfig({
     baseURL: 'http://127.0.0.1:5173',
     // NOT 'on-first-retry': with retries: 0 that would never fire.
     trace: 'retain-on-failure',
-    launchOptions: {
-      // Makes the test independent of host multicast-DNS resolution. Without
-      // it Chromium emits mDNS-obfuscated <uuid>.local host candidates, and
-      // whether those resolve is a property of the machine, not of this code.
-      // Measured on this host: Playwright's Chromium resolves them and still
-      // connects, while the user's own Chrome.app does NOT (macOS Local
-      // Network permission) and the handshake ends in conn:failed. The flag
-      // removes that variable so a red test always means a real regression.
-      // Chromium is last-switch-wins and Playwright appends our args last, so
-      // this REPLACES Playwright's own --disable-features list. Never add a
-      // second --disable-features anywhere.
-      args: ['--disable-features=WebRtcHideLocalIpsWithMdns'],
-    },
   },
+  // Stock launch args, deliberately. An earlier revision passed
+  // --disable-features=WebRtcHideLocalIpsWithMdns to strip mDNS obfuscation off
+  // host candidates. It is gone for two measured reasons:
+  //   1. Chromium is last-switch-wins on --disable-features and Playwright
+  //      pushes config args AFTER its own switches, so that one bare flag
+  //      REPLACED Playwright's 16-entry disable list -- silently re-enabling
+  //      PaintHolding, AvoidUnnecessaryBeforeUnloadCheckSync and the rest, the
+  //      very features Playwright disables to keep automation from hanging.
+  //      (playwright-core 1.62.1 coreBundle.js:34605-34658, then :43093.)
+  //   2. It defended a hazard that does not reproduce. With obfuscation left
+  //      ON, the full handshake reaches channel:open in ~280 ms in BOTH bundled
+  //      Chromium and Google Chrome on this host, and mDNS emission is identical
+  //      in the two builds -- there is no Chromium-vs-Chrome.app asymmetry here.
+  // So the suite now runs the browser the operator actually uses, unmodified,
+  // and mDNS is a variable under test rather than one configured away.
+  projects: [
+    { name: 'chromium', use: { browserName: 'chromium' } },
+    // Needs Google Chrome installed. Without it: npx playwright test --project=chromium
+    { name: 'chrome', use: { browserName: 'chromium', channel: 'chrome' } },
+  ],
   // reuseExistingServer is deliberate: the operator keeps `npm run dev` up for
   // the live walkthrough, and there is no CI in this project.
   webServer: {
