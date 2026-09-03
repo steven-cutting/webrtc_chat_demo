@@ -1,0 +1,18 @@
+{
+  "name": "webrtc-json-wire",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-server WebRTC demo: two browsers exchange typed JSON over an RTCDataChannel",
+  "scripts": {
+    "dev": "vite --host --port 5173 --strictPort",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "typescript": "~6.0.2",
+    "vite": "^8.2.2"
+  }
+}

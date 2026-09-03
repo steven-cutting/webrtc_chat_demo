@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>webrtc json wire</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #2a2f3a; --text: #d8dee9;
+    --dim: #8b93a5; --sent: #7fd1a0; --recv: #7fb4ff; --warn: #ff8f7a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, sans-serif;
+    display: flex; flex-direction: column; min-height: 100vh;
+  }
+  header { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 15px; margin: 0 10px 0 0; display: inline; letter-spacing: .5px; }
+  .badge {
+    display: inline-block; padding: 2px 8px; margin-right: 6px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--panel); font-size: 12px;
+  }
+  #reset { float: right; }
+  .diag {
+    margin: 6px 0 0; font-family: var(--mono); font-size: 11px; color: var(--dim);
+    word-break: break-word;
+  }
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1px; background: var(--line); }
+  section { background: var(--bg); padding: 14px; min-width: 0; display: flex; flex-direction: column; }
+  h2 { font-size: 12px; letter-spacing: .8px; color: var(--dim); margin: 0 0 8px; font-weight: 600; }
+  h3 { font-size: 12px; margin: 0 0 6px; color: var(--text); font-weight: 600; }
+  .explain { color: var(--dim); margin: 0 0 12px; max-width: 46ch; }
+  button {
+    font: inherit; padding: 7px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  }
+  button:hover:not(:disabled) { border-color: #3d4557; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 12px 0; background: var(--panel); }
+  textarea, input {
+    width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px; font-family: var(--mono);
+    /* 16px: below this, iOS Safari zooms on focus and the operator loses the page. */
+    font-size: 16px; resize: vertical;
+  }
+  .row { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+  #blob-meta { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .error { color: var(--warn); min-height: 1.5em; margin: 8px 0 0; }
+  ol#wire-log {
+    list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1;
+    max-height: calc(100vh - 190px); min-height: 220px;
+  }
+  #wire-log li { padding: 5px 0 5px 10px; border-left: 3px solid transparent; margin-bottom: 2px; }
+  #wire-log li .head { font-size: 12px; }
+  #wire-log li pre {
+    margin: 4px 0 0; font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap;
+    word-break: break-all; color: var(--text); opacity: .95;
+  }
+  #wire-log li[data-dir="event"] { color: var(--dim); font-style: italic; font-size: 12px; }
+  #wire-log li[data-dir="sent"] { border-left-color: var(--sent); }
+  #wire-log li[data-dir="sent"] .head::before { content: "→ "; color: var(--sent); }
+  #wire-log li[data-dir="recv"] { border-left-color: var(--recv); }
+  #wire-log li[data-dir="recv"] .head::before { content: "← "; color: var(--recv); }
+  footer { border-top: 1px solid var(--line); padding: 10px 14px; display: flex; gap: 8px; }
+  footer input { flex: 1; }
+  /* The answerer's first action is pasting, so put that card physically first. */
+  body[data-role="answerer"] #local-card { order: 2; }
+  body[data-role="answerer"] #remote-card { order: 1; }
+  #signaling .cards { display: flex; flex-direction: column; }
+  @media (max-width: 720px) { main { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>webrtc json wire</h1>
+  <span class="badge" id="role" data-testid="role">no role yet</span>
+  <span class="badge" id="signal-phase" data-testid="signal-phase">idle</span>
+  <button id="reset" data-testid="reset">Reset</button>
+  <p class="diag" id="diag" data-testid="diag"></p>
+</header>
+
+<main>
+  <section id="signaling">
+    <h2>SIGNALING — you are the wire</h2>
+    <p class="explain">
+      WebRTC never says how these blobs reach the other peer. Normally a signaling
+      server carries them. Here, you do.
+    </p>
+    <div>
+      <button id="create-offer" data-testid="create-offer">Start as OFFERER — create offer</button>
+    </div>
+    <div class="cards">
+      <div class="card" id="local-card" hidden>
+        <h3 id="local-label" data-testid="local-label">1 · Your OFFER — copy it into the other tab</h3>
+        <textarea id="local-blob" data-testid="local-blob" rows="6" readonly
+                  spellcheck="false" autocapitalize="off" autocorrect="off"></textarea>
+        <div class="row">
+          <button id="copy" data-testid="copy">Copy</button>
+          <span id="blob-meta" data-testid="blob-meta"></span>
+        </div>
+      </div>
+      <div class="card" id="remote-card">
+        <h3 id="remote-label" data-testid="remote-label">Paste their OFFER here</h3>
+        <textarea id="remote-blob" data-testid="remote-blob" rows="6"
+                  spellcheck="false" autocapitalize="off" autocorrect="off"
+                  placeholder='{"type":"offer","sdp":"v=0\r\n..."}'></textarea>
+        <div class="row">
+          <button id="accept" data-testid="accept">Join as ANSWERER — accept their offer</button>
+        </div>
+      </div>
+    </div>
+    <p class="error" id="error" data-testid="error"></p>
+  </section>
+
+  <section id="wire">
+    <h2>WIRE — handshake events, then the exact bytes on the data channel</h2>
+    <ol id="wire-log" data-testid="wire-log"></ol>
+  </section>
+</main>
+
+<footer>
+  <input id="compose" data-testid="compose" placeholder="message" autocomplete="off" disabled>
+  <button id="send" data-testid="send" disabled>Send</button>
+</footer>
+
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
