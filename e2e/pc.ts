@@ -94,6 +94,14 @@ export const MDNS_HOST = (uuid: string): string =>
   `a=candidate:1 1 udp 2113937151 ${uuid}.local 50000 typ host generation 0 network-cost 999`;
 export const IP_HOST =
   'a=candidate:2 1 udp 2113937150 192.0.2.1 50001 typ host generation 0 network-cost 999';
+/**
+ * A GLOBALLY ROUTABLE host candidate, and the shape the LAN-only reading used to get wrong:
+ * an endpoint at a public address is reachable from off its network with no srflx candidate
+ * at all, and is issued none -- RFC 8445 §5.1.3 drops that srflx as redundant with its base.
+ * Public IPv6 is where this actually happens, so the fixture is v6 (RFC 3849).
+ */
+export const IP_HOST6 =
+  'a=candidate:7 1 udp 2113937148 2001:db8::1 50006 typ host generation 0 network-cost 999';
 /** Routable, answered by nothing (TEST-NET-1): a pair forms against it and then times out. */
 export const SRFLX_BLACKHOLE =
   'a=candidate:3 1 udp 1677729535 192.0.2.1 50002 typ srflx raddr 0.0.0.0 rport 0 generation 0 network-cost 999';

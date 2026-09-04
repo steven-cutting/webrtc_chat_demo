@@ -16,7 +16,8 @@ depends on the NAT at each end (§5). Nothing in this repo measures that case. S
 two tabs on one machine, is what is actually exercised.
 
 What changed is only what the app *says* about that case. It is now named as what it is —
-before the exchange, by a `LAN ONLY` marker on any blob carrying no `srflx` candidate, and
+before the exchange, by a `LAN ONLY` marker on any blob whose every candidate is a LAN
+address, and
 after it, by a post-mortem that reports a missing relay instead of macOS Local Network
 settings. Diagnosed is not connected, and neither one is measured.
 
@@ -141,7 +142,8 @@ The diagnostics strip and the wire log say why:
 **Read the post-mortem first.** On `conn → failed` the app samples `getStats()` and
 prints what it measured — an evidence line (`post-mortem — pairs:… udp-host-pairs:…
 remote-hosts:… mdns-offered:… local-udp-hosts:… local-srflx:… remote-srflx:… nets:…
-sent:… recv:… answered:…`) followed by every verdict that holds. It is
+families:…|… sent:… recv:… answered:…`) followed by every verdict that holds, most
+conclusive first — and `ui.error` shows only the first, so the ranking is the message. It is
 sampled on a timer during checking rather than read once at `failed`, because
 libwebrtc destroys write-timed-out connections as it reports failed: measured here,
 the sampler saw 1 candidate pair on all 15 ticks while a read from inside the `failed`
@@ -156,10 +158,15 @@ handler returned 0.
   not proves: Chrome reports a remote candidate only once a pair exists for it, so a name
   that did resolve but to an address nothing here can pair with — an IPv4/IPv6 split, say —
   leaves the same zero behind.
-- **Zero `srflx` candidates** — STUN is unreachable from this network, and nothing you
-  publish can leave it. You no longer have to reach a failure to find that out: the meta
-  line under Copy reads `LAN ONLY` before you hand the blob over, and the post-mortem
-  repeats it as `local-srflx:0`. A lone
+- **Zero `srflx` candidates *and* no routable host address** — STUN is unreachable from
+  this network, and nothing you publish can leave it. You no longer have to reach a failure
+  to find that out: the meta line under Copy reads `LAN ONLY` before you hand the blob over.
+  Both halves are load-bearing: an endpoint sitting at a globally routable address (a public
+  IPv6 is the everyday case) is reachable from anywhere with **no** `srflx` candidate, and is
+  issued none — RFC 8445 §5.1.3 eliminates a candidate whose transport address *and* base
+  equal another's, which is exactly that one. So `local-srflx:0` alone is not the verdict;
+  an mDNS `.local` name, on the other hand, *is* LAN-only whatever address it hides, because
+  multicast DNS is link-scope. A lone
   `ice candidate error 701` is *not* that. 701 is not a STUN error code at all: the W3C
   definition of `errorCode` sets it "if no host candidate can reach the server", which is
   reachability in general, not name resolution — libwebrtc raises it both for a lookup
@@ -168,29 +175,46 @@ handler returned 0.
   one 701 for `stun.l.google.com` in a run that still published a working `srflx`
   candidate. The candidate count on the next line is the actual check.
 - **Both** — there is no path, and with TURN out of scope nothing here can fix it.
-- **`nets:different`** — the two ends were reflected to different public addresses, so they
-  are on different networks. `remote-hosts:0` beside a non-zero `mdns-offered` implicates
-  nothing here: a `.local` name *cannot* resolve across the internet, so that zero is the
-  expected reading and the mDNS verdict above is suppressed rather than printed. What had to
-  work was the `srflx` pair, and when it did not, two readings fit that `getStats()` cannot
-  separate — a NAT that maps per destination (symmetric), which mobile carriers commonly run,
-  or a firewall that drops inbound UDP. Neither is beaten by STUN alone. The missing piece is
-  a relay, which is out of scope (see "Deliberately not here"); the workaround that needs no
-  relay is to put both devices on one network.
-  - `nets:same` — one NAT reflects both ends, so they really are on one network and the mDNS
-    reading stays live.
+- **`nets:different`** — the two ends were reflected to different public addresses. That
+  **usually** means different networks; it is a reading and not a topology, and it is wrong
+  in both directions. A dual-WAN router, a NAT address pool, or a VPN on one side reflects
+  two peers on **one** network to two addresses. So the verdict says "reflected to different
+  public addresses" rather than "are on different networks", and it does not *suppress* the
+  mDNS finding — it outranks it. The mDNS advice is still printed below, under its condition,
+  for the operator this reading has misclassified. Taken at its usual meaning: `remote-hosts:0`
+  beside a non-zero `mdns-offered` implicates nothing, because a `.local` name *cannot*
+  resolve across the internet, so that zero is expected. What had to work was the `srflx`
+  pair, and when it did not, two readings fit that `getStats()` cannot separate — a NAT that
+  maps per destination (symmetric), which mobile carriers commonly run, or a firewall that
+  drops inbound UDP. Neither is beaten by STUN alone. The missing piece is a relay, which is
+  out of scope (see "Deliberately not here"); the workaround that needs no relay is to put
+  both devices on one network.
+  - `nets:same` — one NAT reflected both ends to one address, so the mDNS reading stays live
+    and keeps the headline. Not proof of one network either: a single carrier CGNAT reflects
+    two unrelated subscriber networks to the same public address, and nothing here can tell
+    that apart. The mDNS verdict says so in its own text rather than leaving it implied.
   - `nets:unknown` — one side published no `srflx` at all, so the addresses cannot be
     compared; `local-srflx` / `remote-srflx` say which side. Note the gap this leaves: the
     mDNS verdict can still take the headline here even when the peer is demonstrably
     elsewhere, which is why the `LAN ONLY` marker exists on the publishing side.
+  - `families:v4+v6|v6+?` — the address families on each side, over **every** candidate that
+    carries a literal. A trailing `?` is an mDNS name, whose family is not knowable from the
+    SDP.
   - `local-mapped:` / `remote-mapped:` **are public IP addresses.** They are the evidence for
     `nets:`, they are already inside the blob you paste around, and they are printed on that
     one line and nowhere else — so a log pasted into a bug report can be redacted a line at a
     time rather than mid-sentence.
-- **One end reflected only IPv4 and the other only IPv6** — its own verdict, and it leads
+- **One end published only IPv4 and the other only IPv6** — its own verdict, and it leads
   ahead of `nets:different`, because it is provable rather than ranked: with no family in
   common there is no address the two ends share, so the absent pair is arithmetic and not a
   suspicion. Only a relay bridges two address families.
+
+  It is read across **every** candidate, and it will not fire while either side shows a `?`
+  in `families:`. The reflexive candidates alone cannot carry it — ICE pairs a host candidate
+  on one side with a same-family `srflx` on the other, and an mDNS name hides a family that
+  might be the bridge. When only the *reflexive* families are disjoint, that observation is
+  folded into the `nets:different` verdict as a sentence instead: it rules out the reflexive
+  pair, which is the pair that had to work, and nothing wider.
 - **`conn → failed`** — Reset is **not** the general remedy, and for a blocked path it
   is the one action guaranteed to reproduce the failure. Reset when the post-mortem says
   this session *had been connected* and then lost the path, when it says ICE reported

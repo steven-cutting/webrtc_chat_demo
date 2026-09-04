@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { installPc, IP_HOST, MDNS_HOST, SRFLX, SRFLX6, SRFLX_BLACKHOLE, UDP_HOST } from './pc';
+import { installPc, IP_HOST, IP_HOST6, MDNS_HOST, SRFLX, SRFLX6, SRFLX_BLACKHOLE, UDP_HOST } from './pc';
 
 // The getStats() post-mortem in src/main.ts §8. It replaces one fixed sentence
 // ("Press Reset in both tabs and redo the exchange") that used to be printed under
@@ -191,14 +191,23 @@ test('does NOT blame mDNS when the two ends have different public addresses', as
   await synthesizeFailure(page);
 
   await expect(page.getByTestId('wire-log')).toContainText('local-srflx:1 remote-srflx:1 nets:different');
-  // The suppression, headline and log alike. mdns-offered is still 1: the peer really did
-  // offer .local names, and the evidence line still says so. It is the VERDICT that is wrong.
+  // mdns-offered is still 1: the peer really did offer .local names, and the evidence line
+  // still says so. It is the VERDICT that was wrong.
   await expect(page.getByTestId('wire-log')).toContainText('mdns-offered:1');
-  // The suppression -- and NOT by the absence of the phrase '.local host candidates', which
-  // the cross-network verdict uses itself to say why that zero is expected. What must be
-  // gone is the mDNS verdict's own two marks: its ranked cause and its remedy.
-  await expect(page.getByTestId('wire-log')).not.toContainText('leading suspect');
-  await expect(page.getByTestId('wire-log')).not.toContainText('Local Network');
+  // DEMOTED, not suppressed -- the change review asked for. Disjoint mapped addresses are a
+  // reading and not a topology: a dual-WAN router, a NAT address pool or a VPN on one side
+  // puts two peers on ONE network at two public addresses, and a hard gate there would throw
+  // away advice that was correct. So the assertion is on ui.error, which shows findings[0]
+  // alone -- what the operator on cellular actually reads. Not the absence of the phrase
+  // '.local host candidates', which the cross-network verdict uses itself to say why that
+  // zero is expected: what must be out of the headline is the mDNS verdict's own two marks,
+  // its ranked cause and its remedy.
+  await expect(page.getByTestId('error')).toContainText('reflected to different public addresses');
+  await expect(page.getByTestId('error')).not.toContainText('leading suspect');
+  await expect(page.getByTestId('error')).not.toContainText('Local Network');
+  // ...and still in the log, under its condition, for the case the reading got wrong.
+  await expect(page.getByTestId('wire-log')).toContainText('Only if the two devices are on one network after all');
+  await expect(page.getByTestId('wire-log')).toContainText('Local Network');
 
   await ctx.close();
 });
@@ -259,6 +268,14 @@ test('keeps blaming mDNS when the two ends share a public address', async ({ bro
   await expect(page.getByTestId('wire-log')).toContainText('local-srflx:1 remote-srflx:1 nets:same');
   await expect(page.getByTestId('error')).toContainText('no candidate pair was ever formed against');
   await expect(page.getByTestId('error')).toContainText('Local Network');
+  // Unconditional here -- no prefix, because nothing above outranked it.
+  await expect(page.getByTestId('error')).not.toContainText('Only if the two devices');
+  // The error this reading makes in the OTHER direction, said where it is being made: one
+  // carrier CGNAT reflects two unrelated subscriber networks to a single address, so a
+  // matching pair of mapped addresses is not proof of a shared network either. Raised in
+  // review, undetectable from here, and therefore stated rather than silently assumed away.
+  await expect(page.getByTestId('error')).toContainText('carrier CGNAT');
+  await expect(page.getByTestId('error')).toContainText('If the peer is on cellular');
   await expect(page.getByTestId('wire-log')).not.toContainText('different public addresses');
 
   await ctx.close();
@@ -269,9 +286,51 @@ test('names an address-family split as the thing that makes a pair impossible', 
   const page = await ctx.newPage();
   const donor = await ctx.newPage();
 
-  // The one cross-network reading that is provable rather than ranked: with no family in
-  // common there is no address the two ends share, so the absent pair is arithmetic, not a
-  // suspicion. It leads when it holds, ahead of the symmetric-NAT reading.
+  // The one cross-network reading that is provable rather than ranked -- but only when it is
+  // read across EVERY candidate, which is the correction review asked for. Both sides carry
+  // literals here and neither carries an mDNS name, so the families are fully known: v4 on
+  // this side, v6 on the peer's, nothing that could bridge them. THEN "no candidate pair
+  // could exist" is arithmetic, and it leads ahead of the symmetric-NAT reading.
+  await installPc(page, {
+    stats: [
+      ['P', PAIR({})],
+      ['L', { type: 'local-candidate', candidateType: 'srflx', protocol: 'udp' }],
+      ['R', { type: 'remote-candidate', candidateType: 'srflx', protocol: 'udp' }],
+    ],
+    localCandidates: [UDP_HOST, SRFLX('203.0.113.9')],
+  });
+  await answererWith(page, donor, [IP_HOST6, SRFLX6('2001:db8::1')]);
+  await synthesizeFailure(page);
+
+  await expect(page.getByTestId('wire-log')).toContainText('families:v4|v6');
+  await expect(page.getByTestId('error')).toContainText('only IPv4 candidates and the peer only IPv6');
+  await expect(page.getByTestId('error')).toContainText('not just the reflexive ones');
+  await expect(page.getByTestId('error')).toContainText('no address the two ends share');
+  // Disjoint families are disjoint addresses, so the cross-network reading holds too -- it
+  // is simply the weaker of the two and must not take the headline from it.
+  await expect(page.getByTestId('wire-log')).toContainText('nets:different');
+  await expect(page.getByTestId('wire-log')).toContainText('different public addresses');
+  await expect(page.getByTestId('wire-log')).not.toContainText('leading suspect');
+  await expect(page.getByTestId('wire-log')).not.toContainText('Local Network');
+
+  await ctx.close();
+});
+
+test('an mDNS name on the peer keeps the family reading inside the cross-network verdict', async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const donor = await ctx.newPage();
+
+  // The same disjoint reflexive families as above, with one thing changed: the peer also
+  // published a .local name. That name hides an address of unknown family, and a family it
+  // might bridge is a family this cannot rule out -- so "no candidate pair could exist" is
+  // no longer arithmetic and must not be printed. Raised in review, and true: ICE pairs a
+  // host candidate on one side with a same-family reflexive one on the other, so the
+  // reflexive subset alone never licensed an endpoint-wide claim.
+  //
+  // The observation is not thrown away, though. It rules out the REFLEXIVE pair, which is
+  // the pair that had to work across networks, so it rides inside the cross-network verdict
+  // as a sentence rather than taking a headline of its own.
   await installPc(page, {
     stats: [
       ['P', PAIR({})],
@@ -283,14 +342,48 @@ test('names an address-family split as the thing that makes a pair impossible', 
   await answererWith(page, donor, [MDNS_HOST('4f1a2c3d-7777-4000-8000-abcdef123456'), SRFLX6('2001:db8::1')]);
   await synthesizeFailure(page);
 
-  await expect(page.getByTestId('error')).toContainText('only IPv4 server-reflexive candidates and the peer only IPv6');
-  await expect(page.getByTestId('error')).toContainText('no address the two ends share');
-  // Disjoint families are disjoint addresses, so the cross-network reading holds too -- it
-  // is simply the weaker of the two and must not take the headline from it.
-  await expect(page.getByTestId('wire-log')).toContainText('nets:different');
-  await expect(page.getByTestId('wire-log')).toContainText('different public addresses');
-  await expect(page.getByTestId('wire-log')).not.toContainText('leading suspect');
-  await expect(page.getByTestId('wire-log')).not.toContainText('Local Network');
+  // The ? is the mDNS name, and it is why the strong verdict is off the table.
+  await expect(page.getByTestId('wire-log')).toContainText('families:v4|v6+?');
+  await expect(page.getByTestId('error')).toContainText('reflected to different public addresses');
+  await expect(page.getByTestId('error')).toContainText('share no address family');
+  await expect(page.getByTestId('error')).toContainText('IPv4 here, IPv6 there');
+  // Scoped to the reflexive pair in the same breath, rather than left to be over-read.
+  await expect(page.getByTestId('error')).toContainText('Not the whole endpoint');
+  await expect(page.getByTestId('error')).not.toContainText('no candidate pair could exist');
+  await expect(page.getByTestId('error')).not.toContainText('two disjoint address families');
+
+  await ctx.close();
+});
+
+test('a peer whose only candidate is a routable host address is not called LAN-only', async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const donor = await ctx.newPage();
+
+  // The post-mortem was repeating the pre-copy marker's mistake, which review said in as
+  // many words. A peer at a globally routable host address publishes no srflx -- RFC 8445
+  // §5.1.3 drops it as redundant with its base -- and is reachable anyway, so reading that
+  // blob as "everything in it was a LAN address" is false about a blob that would work.
+  //
+  // This side is dual-stack so the family reading stays out of the way: the peer is v6-only,
+  // and a v4-only local set would make this an address-family split instead, which is a
+  // different verdict about a different thing.
+  await installPc(page, {
+    stats: [
+      ['P', PAIR({})],
+      ['L', { type: 'local-candidate', candidateType: 'srflx', protocol: 'udp' }],
+      ['R', { type: 'remote-candidate', candidateType: 'host', protocol: 'udp' }],
+    ],
+    localCandidates: [UDP_HOST, SRFLX('203.0.113.9'), SRFLX6('2001:db8::2')],
+  });
+  await answererWith(page, donor, [IP_HOST6]);
+  await synthesizeFailure(page);
+
+  await expect(page.getByTestId('wire-log')).toContainText('remote-srflx:0');
+  await expect(page.getByTestId('wire-log')).toContainText('families:v4+v6|v6');
+  await expect(page.getByTestId('wire-log')).not.toContainText('was a LAN address');
+  // and it still says the thing that IS true about this snapshot
+  await expect(page.getByTestId('error')).toContainText('none came back');
 
   await ctx.close();
 });
