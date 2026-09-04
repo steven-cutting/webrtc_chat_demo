@@ -8,6 +8,13 @@ without reading the bytes.
 There is no signaling server. **You** are the signaling channel: you copy one JSON
 blob from tab A into tab B, and the answer back.
 
+**Live: <https://stevencutting.com/webrtc_chat_demo/>** — two tabs, nothing to install.
+Static hosting, so there is still no server in the loop. A public URL buys reach it cannot
+deliver, though: there is no TURN here, so two people on *different* networks will still
+fail to connect (§5 below). Same LAN, or two tabs on one machine.
+
+To run it locally instead:
+
 ```
 npm install
 npm run dev          # note BOTH printed URLs: Local and Network
@@ -20,9 +27,9 @@ into the first and click **Accept answer**. Both tabs show `channel:open`. Type.
 | Script | What it does |
 | --- | --- |
 | `npm run dev` | Vite on `0.0.0.0:5173` (`--strictPort`, so a port collision is loud) |
-| `npm run typecheck` | `tsc --noEmit` over `src/`, `e2e/`, `playwright.config.ts` |
+| `npm run typecheck` | `tsc --noEmit` over `src/`, `e2e/`, `playwright.config.ts`, `vite.config.ts` |
 | `npm run test:e2e` | Playwright, two projects (bundled Chromium, and Google Chrome via `channel`) on **stock launch args**, so mDNS obfuscation stays on: `handshake.spec.ts` runs the full two-context handshake and asserts byte-identity both ways; `ice-timeout.spec.ts` drives the gathering-timeout path against a black-holed STUN/TURN address; `post-mortem.spec.ts` covers the failure diagnosis in §8, six of its seven tests from a stats fixture rather than a real 15 s timeout; `answerer-clock.spec.ts` measures the no-deadline claim with a deliberate 20 s stall (~1 min 45 s total; the chromium-only tests carry the deliberate waits). Add `--project=chromium` if Chrome is not installed |
-| `npm run build` | Production bundle (nothing here is deployed; this is just a gate) |
+| `npm run build` | Production bundle into `dist/` — exactly what GitHub Pages serves |
 
 ## The handshake
 
@@ -82,15 +89,26 @@ into the first and click **Accept answer**. Both tabs show `channel:open`. Type.
 
 ## Across devices
 
-`npm run dev` binds `0.0.0.0` and prints a `➜ Network:` URL. Open **that IP literal**
-on a phone on the same Wi-Fi — not `<hostname>.local`, which Vite's default
-`allowedHosts` rejects with "Blocked request".
+Two origins reach a phone, and they differ in exactly one thing: whether the context is
+secure. The diagnostics strip says which one you are on — `location.origin` and
+`secure:<bool>` are its first two fields.
 
-Plain HTTP is deliberate. `RTCPeerConnection`, `createDataChannel` and STUN are **not**
-secure-context gated, so no cert, no trust profile, no interstitial. `navigator.clipboard`
-*is* gated (it is `undefined` on `http://192.168.x.x:5173`), so the Copy button
-feature-detects it and falls back to selecting the text — and pasting never needed an
-API at all.
+**The dev server, plain HTTP.** `npm run dev` binds `0.0.0.0` and prints a `➜ Network:`
+URL. Open **that IP literal** on a phone on the same Wi-Fi — not `<hostname>.local`, which
+Vite's default `allowedHosts` rejects with "Blocked request".
+
+Plain HTTP is deliberate here and still is. `RTCPeerConnection`, `createDataChannel` and
+STUN are **not** secure-context gated, so no cert, no trust profile, no interstitial.
+`navigator.clipboard` *is* gated (it is `undefined` on `http://192.168.x.x:5173`), so the
+Copy button feature-detects it and falls back to selecting the text — and pasting never
+needed an API at all.
+
+**The hosted copy, HTTPS.** Same bundle, same STUN server, same absent signaling server;
+the only difference is that a secure context has `navigator.clipboard`, so Copy takes that
+branch instead of the selection fallback. Measured rather than read off the source: with
+both paths instrumented on the built bundle over a secure origin, a real click called
+`writeText` once and `execCommand` zero times, leaving the textarea unselected. The button
+says "Copied" either way, so the label is not the evidence.
 
 **Acceptance:** `channel:open` on both physical devices, and a chat envelope visible in
 the receiving device's wire log.
@@ -153,9 +171,9 @@ handler returned 0.
   Origin-scoped alternative, no System Settings needed: allow camera + microphone for
   `http://localhost:5173` in `chrome://settings/content`, since Chrome skips mDNS
   obfuscation for origins holding media-capture permission (mechanism is consistent
-  with Chromium's design; not exercised by anything in this repo, and **localhost
-  only** — media-capture permission needs a secure context, so it is unavailable on
-  the `http://<lan-ip>:5173` origin the phone uses).
+  with Chromium's design; not exercised by anything in this repo). Media-capture
+  permission needs a secure context, so this lever exists on `localhost` and on the
+  hosted HTTPS origin, and **not** on the `http://<lan-ip>:5173` origin the phone uses.
 
   **Calibration, and it is weaker than it used to read here.** An earlier revision said
   this failure did not reproduce under automation. That claim stands as a measurement
@@ -184,6 +202,25 @@ live pair and `remote-hosts:0` in the same snapshot. A
 pair against the LAN address in state `failed` means something else: local-subnet
 unicast blocked rather than name resolution, same fix but a different claim.
 
+## Deployed
+
+`.github/workflows/deploy-pages.yml` builds on push to `main` and publishes `dist/` to
+GitHub Pages. The gate is `npm run typecheck && npm run build`. The Playwright suite is
+deliberately not in it — it needs a browser install and spends ~1 min 45 s on deliberate
+waits, and nothing it covers can break from a change that typechecks and bundles — so it
+stays a local check. `dist/` is never committed; the workflow uploads it as an artifact.
+
+The URL is inherited rather than configured. The account's user site carries a custom apex
+domain, and GitHub serves every project site in that account beneath it, so this lands at
+`stevencutting.com/webrtc_chat_demo/` and `steven-cutting.github.io/webrtc_chat_demo/`
+301s there. There is no `CNAME` file in this repo and there could not usefully be one:
+Actions-based publishing ignores it, and the override is a repo setting instead.
+
+`vite.config.ts` sets `base: './'` so the bundle resolves under that subpath while naming
+the repo nowhere. It relies on Pages redirecting `/webrtc_chat_demo` to
+`/webrtc_chat_demo/` before the document is parsed — long-standing behavior that GitHub
+does not actually document, so it is worth re-checking with `curl -sI` if assets ever 404.
+
 ## What's on the wire
 
 ```ts
@@ -205,6 +242,12 @@ aspirational. A frame that fails the guard is logged, never dropped silently.
 
 ## Deliberately not here
 
-Signaling server · TURN · mesh/rooms/>2 peers · HTTPS · blob compression or QR ·
+Signaling server · TURN · mesh/rooms/>2 peers · blob compression or QR ·
 SDP rewriting · `restartIce()` and auto-reconnect · audio/video · backpressure
 handling · persistence, nicknames, typing indicators, file transfer.
+
+HTTPS used to be on that list and is now only half off it. This repo still terminates no
+TLS and configures no cert; `npm run dev` is plain HTTP by design. The hosted copy is
+HTTPS because Pages is, not because anything here asked for it — and nothing in the code
+requires a secure context, which is exactly why `seq` is a counter rather than
+`crypto.randomUUID()` (`src/protocol.ts`).

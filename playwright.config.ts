@@ -33,7 +33,10 @@ export default defineConfig({
     { name: 'chrome', use: { browserName: 'chromium', channel: 'chrome' } },
   ],
   // reuseExistingServer is deliberate: the operator keeps `npm run dev` up for
-  // the live walkthrough, and there is no CI in this project.
+  // the live walkthrough. CI does not run this suite -- .github/workflows/deploy-pages.yml
+  // gates the Pages deploy on typecheck + build only, so this is a local check.
+  // Note what that leaves uncovered: webServer runs `npm run dev`, so every spec here
+  // exercises the dev server and nothing exercises the built bundle Pages serves.
   webServer: {
     command: 'npm run dev',
     url: 'http://127.0.0.1:5173',

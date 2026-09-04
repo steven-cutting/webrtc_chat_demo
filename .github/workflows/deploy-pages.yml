@@ -1,0 +1,59 @@
+# Builds the demo and publishes it to GitHub Pages.
+#
+# The gate is typecheck + build, not the Playwright suite: that suite needs a browser
+# install and spends ~1 min 45 s on deliberate waits, and what it covers -- the ICE
+# handshake -- cannot fail from a change that typechecks and bundles. It stays a local
+# check. `pull_request` runs the same gate on the PR, with the deploy job skipped, so a
+# change to this file is exercised before it can publish anything.
+name: Deploy to Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys interleave. cancel-in-progress stays false so an in-flight
+# publish finishes rather than leaving the site half-updated.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # vite 8 requires node ^20.19.0 || >=22.12.0 and package.json declares no engines,
+      # so the version is pinned here rather than inherited from the runner image.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+      # path is REQUIRED and defaults to _site/; vite builds to dist/.
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
