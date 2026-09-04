@@ -21,7 +21,7 @@ into the first and click **Accept answer**. Both tabs show `channel:open`. Type.
 | --- | --- |
 | `npm run dev` | Vite on `0.0.0.0:5173` (`--strictPort`, so a port collision is loud) |
 | `npm run typecheck` | `tsc --noEmit` over `src/`, `e2e/`, `playwright.config.ts` |
-| `npm run test:e2e` | Playwright, two projects (bundled Chromium, and Google Chrome via `channel`) on **stock launch args**, so mDNS obfuscation stays on: `handshake.spec.ts` runs the full two-context handshake and asserts byte-identity both ways; `ice-timeout.spec.ts` drives the gathering-timeout path against a black-holed STUN/TURN address (~50 s total, mostly one deliberate 40 s back-off). Add `--project=chromium` if Chrome is not installed |
+| `npm run test:e2e` | Playwright, two projects (bundled Chromium, and Google Chrome via `channel`) on **stock launch args**, so mDNS obfuscation stays on: `handshake.spec.ts` runs the full two-context handshake and asserts byte-identity both ways; `ice-timeout.spec.ts` drives the gathering-timeout path against a black-holed STUN/TURN address; `post-mortem.spec.ts` covers the failure diagnosis in §8, six of its seven tests from a stats fixture rather than a real 15 s timeout; `answerer-clock.spec.ts` measures the no-deadline claim with a deliberate 20 s stall (~1 min 45 s total; the chromium-only tests carry the deliberate waits). Add `--project=chromium` if Chrome is not installed |
 | `npm run build` | Production bundle (nothing here is deployed; this is just a gate) |
 
 ## The handshake
@@ -99,39 +99,90 @@ the receiving device's wire log.
 
 The diagnostics strip and the wire log say why:
 
+**Read the post-mortem first.** On `conn → failed` the app samples `getStats()` and
+prints what it measured — an evidence line (`post-mortem — pairs:… udp-host-pairs:…
+remote-hosts:… mdns-offered:… sent:… recv:… answered:…`) followed by every verdict that
+holds. It is
+sampled on a timer during checking rather than read once at `failed`, because
+libwebrtc destroys write-timed-out connections as it reports failed: measured here,
+the sampler saw 1 candidate pair on all 15 ticks while a read from inside the `failed`
+handler returned 0.
+
 - **All host candidates end in `.local`** — this on its own is **normal, not a fault**.
   Chrome obfuscates host candidates with mDNS by default for any origin that does not
   hold camera/microphone permission, so you will see it on every healthy run too
   (measured here: `.local` candidates present in 100% of runs that connected fine).
-  It only implicates multicast when it appears *together with* `ice → failed`. If it
-  does, then suspect the network: guest VLANs and APs with client isolation block
-  mDNS, which is one hop and never crosses subnets. On macOS, suspect the OS first
-  (see below).
-- **Zero `srflx` candidates** — STUN is unreachable from this network.
+  What implicates resolution is `remote-hosts:0` next to a non-zero `mdns-offered` in the
+  post-mortem — the peer named hosts and not one of them ever became a pair. *Implicates*,
+  not proves: Chrome reports a remote candidate only once a pair exists for it, so a name
+  that did resolve but to an address nothing here can pair with — an IPv4/IPv6 split, say —
+  leaves the same zero behind.
+- **Zero `srflx` candidates** — STUN is unreachable from this network. A lone
+  `ice candidate error 701` is *not* that. 701 is not a STUN error code at all: the W3C
+  definition of `errorCode` sets it "if no host candidate can reach the server", which is
+  reachability in general, not name resolution — libwebrtc raises it both for a lookup
+  failure (`STUN host lookup received error.`) and for a plain timeout (`STUN binding
+  request timed out.`), so the `errorText` logged beside it is what says which. Seen here:
+  one 701 for `stun.l.google.com` in a run that still published a working `srflx`
+  candidate. The candidate count on the next line is the actual check.
 - **Both** — there is no path, and with TURN out of scope nothing here can fix it.
-- **`conn → failed`** — press **Reset** in both tabs and redo the exchange. Session
-  descriptions are single-use; a stale blob cannot be re-pasted.
-- **macOS: `conn → failed` with all-`.local` candidates, even between two tabs of the
-  same browser** — try granting Chrome **Local Network** access in System Settings →
-  Privacy & Security → Local Network; without it Chrome may be unable to resolve mDNS
-  candidates. Origin-scoped alternative, no System Settings needed: allow camera +
-  microphone for `http://localhost:5173` in `chrome://settings/content`, since Chrome
-  skips mDNS obfuscation for origins holding media-capture permission (mechanism is
-  consistent with Chromium's design; not exercised by anything in this repo, and
-  **localhost only** — media-capture permission needs a secure context, so it is
-  unavailable on the `http://<lan-ip>:5173` origin the phone uses).
-  Calibration before you spend time here: this failure did **not** reproduce under
-  automation. Driving the full handshake with mDNS obfuscation left on, Google Chrome
-  152 from `/Applications` and bundled Chromium 151 both reached `channel:open` in
-  under 300 ms, with `.local` candidates on both sides. The caveat that keeps this
-  from being conclusive: Playwright launches Chrome with a fresh temporary profile,
-  and macOS attributes Local Network permission to the *responsible process*, which
-  for a terminal-spawned browser may be the terminal rather than Chrome.app — so a
-  Dock-launched Chrome can still differ. Treat Local Network permission as one
-  hypothesis, not the diagnosis, and confirm in `chrome://webrtc-internals` before
-  changing OS settings.
+- **`conn → failed`** — Reset is **not** the general remedy, and for a blocked path it
+  is the one action guaranteed to reproduce the failure. Reset when the post-mortem says
+  this session *had been connected* and then lost the path, when it says ICE reported
+  `connected` before the failure (so what broke is after ICE), or when you are re-running
+  with a stale blob; session descriptions are single-use. A retained `succeeded` pair on
+  its own licenses none of that — it is a reading of an earlier sample, not of the state at
+  failure, and a path found and then lost before DTLS finishes leaves exactly that trace.
+  The post-mortem labels that case as historical rather than deciding it for you.
+- **`ice → failed` exactly 15 s after `ice → checking`** — that is libwebrtc's
+  `CONNECTION_WRITE_TIMEOUT`: every pair went write-timeout without one answered check.
+  It does **not** mean you pasted too slowly. The answerer has no delivery deadline,
+  because the offerer answers Binding Requests against its own credentials long before
+  it applies the answer (RFC 8445 §7.3). Measured by `answerer-clock.spec.ts`: an
+  answer withheld for 20 s — past the timeout — still reaches `channel:open`.
+- **macOS: `conn → failed` with `udp-host-pairs:0`, even between two browsers on one
+  Mac** — the leading suspect is **Local Network** access in System Settings → Privacy
+  & Security → Local Network. Enable it for **both** browsers and relaunch them.
+  Note what the topology rules out: with both peers on one machine, `route get` for the
+  LAN address returns `lo0`, so once a `.local` name resolves the media path is kernel
+  loopback and never touches the LAN. Guest VLANs and AP client isolation — real mDNS
+  blockers between *devices* — are categorically inapplicable here. What that rules out is
+  everything *outside* the machine, and nothing inside it: the OS permission, the browser's
+  own mDNS responder, a stale browser process and local filtering software all remain in
+  scope, which is why the calibration below keeps more than one hypothesis open.
+  Origin-scoped alternative, no System Settings needed: allow camera + microphone for
+  `http://localhost:5173` in `chrome://settings/content`, since Chrome skips mDNS
+  obfuscation for origins holding media-capture permission (mechanism is consistent
+  with Chromium's design; not exercised by anything in this repo, and **localhost
+  only** — media-capture permission needs a secure context, so it is unavailable on
+  the `http://<lan-ip>:5173` origin the phone uses).
 
-`chrome://webrtc-internals` is the confirming second opinion.
+  **Calibration, and it is weaker than it used to read here.** An earlier revision said
+  this failure did not reproduce under automation. That claim stands as a measurement
+  and falls as evidence, because the suite cannot reproduce this topology:
+  `handshake.spec.ts` builds both peers with `browser.newContext()` from **one**
+  `browser` fixture — one process, one network service, one mDNS stack — and
+  `playwright.config.ts` declares no `webkit` project. **No automated run here has ever
+  exercised two independent browser instances, or two engines.** Two further
+  differences between the passing and failing runs are open: macOS attributes Local
+  Network permission to the *responsible process*, which for a terminal-spawned browser
+  may be the terminal rather than Chrome.app; and Playwright spawns fresh from
+  `/Applications`, so it can run a newer build than the long-lived Dock-launched
+  process that failed (seen here: bundle 152, running helpers 149).
+  So Local Network remains **one hypothesis, not the diagnosis**. To settle it, change
+  one variable at a time, pasting fast each run: (A) as-is; (B) both tabs in the *same*
+  browser; (C) fully quit and relaunch both browsers, setting untouched; (D) enable
+  Local Network. Only *C fails and D connects* licenses calling the permission the
+  cause — if C connects, it was the stale process.
+
+`chrome://webrtc-internals` is the confirming second opinion. Under the mDNS story
+there is no remote `host` row and no pair against the LAN address at all — only pairs
+against the remote `srflx`, `requestsSent` climbing and `responsesReceived` at 0. That
+shape is what the real-ICE canary in `post-mortem.spec.ts` reproduces and measures: one
+unresolvable `.local` plus one blackholed routable candidate, and the sampler reports a
+live pair and `remote-hosts:0` in the same snapshot. A
+pair against the LAN address in state `failed` means something else: local-subnet
+unicast blocked rather than name resolution, same fix but a different claim.
 
 ## What's on the wire
 
