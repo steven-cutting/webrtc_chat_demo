@@ -387,13 +387,14 @@ interface Candidates {
   mdnsHosts: number;
   /** `typ host` lines carried over UDP -- the only ones that can ever pair. */
   udpHosts: number;
-  /** `typ srflx` lines -- whether anything here can leave this LAN at all. */
+  /** `typ srflx` lines. NOT on its own the answer to "can this leave the LAN" -- canLeaveLan(). */
   srflx: number;
   /**
-   * The mapped addresses of those lines: this side as the STUN server saw it. Two ends
-   * whose sets intersect are behind one NAT; two whose sets are disjoint are on different
-   * networks. That comparison is the only thing separating a broken multicast stack from
-   * a cross-network attempt, and getStats() cannot make it -- see §8.
+   * The mapped addresses of those lines: this side as the STUN server saw it. Comparing the
+   * two ends' sets is the only thing separating a broken multicast stack from a cross-network
+   * attempt -- getStats() cannot make it, because both produce an identical report -- but it
+   * is a READING and not a topology, and it errs in both directions. §8 has the two ways and
+   * the wording they force; do not shorten this to "intersect means one network".
    */
   srflxAddresses: string[];
   /** The families of those addresses. Disjoint families cannot pair, whatever the NAT does. */
