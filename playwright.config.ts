@@ -1,5 +1,10 @@
 import { defineConfig } from '@playwright/test';
 
+/** Everything the dev-server projects share. The subpath project overrides baseURL. */
+const DEV_URL = 'http://127.0.0.1:5173';
+/** The preview server mimics the Pages layout: a project page under a repo-named path. */
+const PAGES_URL = 'http://127.0.0.1:4173/webrtc_chat_demo/';
+
 export default defineConfig({
   testDir: './e2e',
   timeout: 60_000,
@@ -8,7 +13,7 @@ export default defineConfig({
   workers: 1, // two RTCPeerConnections per test
   retries: 0,
   use: {
-    baseURL: 'http://127.0.0.1:5173',
+    baseURL: DEV_URL,
     // NOT 'on-first-retry': with retries: 0 that would never fire.
     trace: 'retain-on-failure',
   },
@@ -28,16 +33,44 @@ export default defineConfig({
   // So the suite now runs the browser the operator actually uses, unmodified,
   // and mDNS is a variable under test rather than one configured away.
   projects: [
-    { name: 'chromium', use: { browserName: 'chromium' } },
+    { name: 'chromium', testIgnore: /pages-build\.spec\.ts/, use: { browserName: 'chromium' } },
     // Needs Google Chrome installed. Without it: npx playwright test --project=chromium
-    { name: 'chrome', use: { browserName: 'chromium', channel: 'chrome' } },
+    { name: 'chrome', testIgnore: /pages-build\.spec\.ts/, use: { browserName: 'chromium', channel: 'chrome' } },
+    // The only project that tests what Pages actually serves: the BUILT bundle, under a
+    // repo-named subpath. It runs the 404 guard plus the real handshake -- the two things
+    // `npm run build` succeeding cannot tell you. This is the project CI runs.
+    {
+      name: 'pages-build',
+      testMatch: [/handshake\.spec\.ts/, /pages-build\.spec\.ts/],
+      use: { browserName: 'chromium', baseURL: PAGES_URL },
+    },
   ],
-  // reuseExistingServer is deliberate: the operator keeps `npm run dev` up for
-  // the live walkthrough, and there is no CI in this project.
-  webServer: {
-    command: 'npm run dev',
-    url: 'http://127.0.0.1:5173',
-    reuseExistingServer: true,
-    timeout: 60_000,
-  },
+  // reuseExistingServer on the dev server is deliberate: the operator keeps `npm run dev`
+  // up for the live walkthrough.
+  //
+  // CI runs `--project=pages-build` (.github/workflows/deploy-pages.yml), so part of this
+  // suite IS a CI gate now. The three chromium-only specs -- ice-timeout, post-mortem,
+  // answerer-clock, ~1 min 45 s of deliberate waits -- stay local.
+  //
+  // Both servers start on every run, because Playwright starts every webServer entry
+  // regardless of --project. So `npm run test:e2e` now also pays one `vite build`.
+  webServer: [
+    {
+      command: 'npm run dev',
+      url: DEV_URL,
+      reuseExistingServer: true,
+      timeout: 60_000,
+    },
+    {
+      // Builds first, so the preview can never serve a stale dist/. reuseExistingServer is
+      // false for the same reason -- a leftover preview would serve the previous bundle
+      // and pass. With --strictPort a collision is loud rather than silently reused.
+      // The script also passes --host 127.0.0.1: measured, `vite preview` binds [::1] ONLY
+      // by default, so this URL times out without it.
+      command: 'npm run preview:pages',
+      url: PAGES_URL,
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
+  ],
 });

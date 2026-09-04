@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite --host --port 5173 --strictPort",
     "build": "vite build",
+    "preview:pages": "vite build && vite preview --base=/webrtc_chat_demo/ --host 127.0.0.1 --port 4173 --strictPort",
     "typecheck": "tsc --noEmit",
     "test:e2e": "playwright test"
   },

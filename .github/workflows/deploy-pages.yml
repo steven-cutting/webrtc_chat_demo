@@ -1,0 +1,88 @@
+# Builds the demo and publishes it to GitHub Pages.
+#
+# The gate is typecheck + build + one Playwright project (`pages-build`) run against the
+# BUILT bundle served at `/webrtc_chat_demo/` -- not the full suite. That project is the
+# only check here that can fail on behaviour: it asserts nothing 404s under the subpath
+# (the failure mode `base: './'` risks) and drives the whole handshake to byte-identity.
+# Typecheck and build alone cannot do that -- a logic change that breaks the handshake
+# still typechecks and bundles.
+#
+# What is still local-only: the three chromium-only specs -- ice-timeout, post-mortem,
+# answerer-clock -- which spend ~1 min 45 s on deliberate waits.
+#
+# `pull_request` runs the same gate on the PR with the deploy job skipped, so a change to
+# this file is exercised before it can publish anything. Note what that leaves unexercised:
+# the deploy job never runs on a PR, so its permissions and concurrency group are proven
+# only by a push to main.
+name: Deploy to Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Workflow-wide is the floor, and the floor is read-only: `build` checks out PR-authored
+# code and runs its npm lifecycle scripts, so it must not hold deployment credentials.
+# pages/id-token live on `deploy` alone.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # vite 8 requires node ^20.19.0 || >=22.12.0 and package.json declares no engines,
+      # so the version is pinned here rather than inherited from the runner image.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+      # chromium only, and only the one project. Measured on run 33840690951: 22 s for the
+      # install, 9 s for the tests -- 31 s added to a job whose 5 m 43 s is almost all
+      # `npm ci`. The project's webServer rebuilds dist/ before serving it, and that
+      # rebuild is what upload-pages-artifact then publishes: the bytes tested here ARE
+      # the bytes deployed, not a second build of the same source.
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --project=pages-build
+
+      # path is REQUIRED and defaults to _site/; vite builds to dist/.
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    # actions/deploy-pages needs exactly these two. It does not check out, so no
+    # contents: read. A job-level block REPLACES the workflow-level one.
+    permissions:
+      pages: write
+      id-token: write
+
+    # Scoped to this job, not the workflow: a workflow-wide group would put PR builds and
+    # main-branch deploys in one queue, and GitHub keeps at most one PENDING member per
+    # group -- a later PR event would evict a pending deploy, regardless of
+    # cancel-in-progress. A job skipped by `if:` never acquires the group, so PR runs stay
+    # out of it. cancel-in-progress stays false so an in-flight publish finishes rather
+    # than leaving the site half-updated.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
