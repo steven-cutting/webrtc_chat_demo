@@ -108,6 +108,15 @@ test('typed JSON envelopes cross the data channel, byte for byte', async ({ brow
     v: 1, seq: 1, from: 'answerer', kind: 'chat', text: FROM_B,
   });
 
+  // 8. The post-mortem's negative control, and the only place it can be made: a run
+  //    that actually connected. §8 samples getStats() on a timer throughout checking,
+  //    so a bug there surfaces as a diagnosis printed over a healthy session.
+  for (const [tag, page] of [['A', A], ['B', B]] as const) {
+    await expect(page.getByTestId('error'), `${tag} put an error on a healthy run`).toHaveText('');
+    await expect(page.getByTestId('wire-log'), `${tag} ran a post-mortem on a healthy run`)
+      .not.toContainText('post-mortem');
+  }
+
   await ctxA.close();
   await ctxB.close();
 });
