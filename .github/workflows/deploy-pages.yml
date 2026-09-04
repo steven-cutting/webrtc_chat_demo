@@ -46,9 +46,11 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
-      # chromium only, and only the one project: the browser install is the expensive
-      # part (~1 min), the tests themselves are seconds. `pages-build` rebuilds via its
-      # own webServer, so it tests a bundle it produced, not the one above.
+      # chromium only, and only the one project. Measured on run 33840690951: 22 s for the
+      # install, 9 s for the tests -- 31 s added to a job whose 5 m 43 s is almost all
+      # `npm ci`. The project's webServer rebuilds dist/ before serving it, and that
+      # rebuild is what upload-pages-artifact then publishes: the bytes tested here ARE
+      # the bytes deployed, not a second build of the same source.
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test --project=pages-build
 
