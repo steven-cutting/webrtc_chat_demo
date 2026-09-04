@@ -21,7 +21,7 @@ into the first and click **Accept answer**. Both tabs show `channel:open`. Type.
 | --- | --- |
 | `npm run dev` | Vite on `0.0.0.0:5173` (`--strictPort`, so a port collision is loud) |
 | `npm run typecheck` | `tsc --noEmit` over `src/`, `e2e/`, `playwright.config.ts` |
-| `npm run test:e2e` | Playwright, two projects (bundled Chromium, and Google Chrome via `channel`) on **stock launch args**, so mDNS obfuscation stays on: `handshake.spec.ts` runs the full two-context handshake and asserts byte-identity both ways; `ice-timeout.spec.ts` drives the gathering-timeout path against a black-holed STUN/TURN address; `post-mortem.spec.ts` covers the failure diagnosis in §8, three of its four tests from a stats fixture rather than a real 15 s timeout; `answerer-clock.spec.ts` measures the no-deadline claim with a deliberate 20 s stall (~1 min 45 s total; the chromium-only tests carry the deliberate waits). Add `--project=chromium` if Chrome is not installed |
+| `npm run test:e2e` | Playwright, two projects (bundled Chromium, and Google Chrome via `channel`) on **stock launch args**, so mDNS obfuscation stays on: `handshake.spec.ts` runs the full two-context handshake and asserts byte-identity both ways; `ice-timeout.spec.ts` drives the gathering-timeout path against a black-holed STUN/TURN address; `post-mortem.spec.ts` covers the failure diagnosis in §8, six of its seven tests from a stats fixture rather than a real 15 s timeout; `answerer-clock.spec.ts` measures the no-deadline claim with a deliberate 20 s stall (~1 min 45 s total; the chromium-only tests carry the deliberate waits). Add `--project=chromium` if Chrome is not installed |
 | `npm run build` | Production bundle (nothing here is deployed; this is just a gate) |
 
 ## The handshake
@@ -101,7 +101,8 @@ The diagnostics strip and the wire log say why:
 
 **Read the post-mortem first.** On `conn → failed` the app samples `getStats()` and
 prints what it measured — an evidence line (`post-mortem — pairs:… udp-host-pairs:…
-mdns-offered:… sent:… recv:… answered:…`) followed by every verdict that holds. It is
+remote-hosts:… mdns-offered:… sent:… recv:… answered:…`) followed by every verdict that
+holds. It is
 sampled on a timer during checking rather than read once at `failed`, because
 libwebrtc destroys write-timed-out connections as it reports failed: measured here,
 the sampler saw 1 candidate pair on all 15 ticks while a read from inside the `failed`
@@ -111,17 +112,28 @@ handler returned 0.
   Chrome obfuscates host candidates with mDNS by default for any origin that does not
   hold camera/microphone permission, so you will see it on every healthy run too
   (measured here: `.local` candidates present in 100% of runs that connected fine).
-  What implicates resolution is `udp-host-pairs:0` next to a non-zero `mdns-offered`
-  in the post-mortem — the peer named hosts and not one of them ever became a pair.
+  What implicates resolution is `remote-hosts:0` next to a non-zero `mdns-offered` in the
+  post-mortem — the peer named hosts and not one of them ever became a pair. *Implicates*,
+  not proves: Chrome reports a remote candidate only once a pair exists for it, so a name
+  that did resolve but to an address nothing here can pair with — an IPv4/IPv6 split, say —
+  leaves the same zero behind.
 - **Zero `srflx` candidates** — STUN is unreachable from this network. A lone
-  `ice candidate error 701` is *not* that: 701 is reported per address family, so on a
-  host with no global IPv6 the AAAA attempt fails on every run while IPv4 succeeds.
-  The candidate count on the next line is the actual check.
+  `ice candidate error 701` is *not* that. 701 is not a STUN error code at all: the W3C
+  definition of `errorCode` sets it "if no host candidate can reach the server", which is
+  reachability in general, not name resolution — libwebrtc raises it both for a lookup
+  failure (`STUN host lookup received error.`) and for a plain timeout (`STUN binding
+  request timed out.`), so the `errorText` logged beside it is what says which. Seen here:
+  one 701 for `stun.l.google.com` in a run that still published a working `srflx`
+  candidate. The candidate count on the next line is the actual check.
 - **Both** — there is no path, and with TURN out of scope nothing here can fix it.
 - **`conn → failed`** — Reset is **not** the general remedy, and for a blocked path it
-  is the one action guaranteed to reproduce the failure. Reset only when the
-  post-mortem says a pair succeeded (the failure is then after ICE) or when you are
-  re-running with a stale blob; session descriptions are single-use.
+  is the one action guaranteed to reproduce the failure. Reset when the post-mortem says
+  this session *had been connected* and then lost the path, when it says ICE reported
+  `connected` before the failure (so what broke is after ICE), or when you are re-running
+  with a stale blob; session descriptions are single-use. A retained `succeeded` pair on
+  its own licenses none of that — it is a reading of an earlier sample, not of the state at
+  failure, and a path found and then lost before DTLS finishes leaves exactly that trace.
+  The post-mortem labels that case as historical rather than deciding it for you.
 - **`ice → failed` exactly 15 s after `ice → checking`** — that is libwebrtc's
   `CONNECTION_WRITE_TIMEOUT`: every pair went write-timeout without one answered check.
   It does **not** mean you pasted too slowly. The answerer has no delivery deadline,
@@ -134,8 +146,10 @@ handler returned 0.
   Note what the topology rules out: with both peers on one machine, `route get` for the
   LAN address returns `lo0`, so once a `.local` name resolves the media path is kernel
   loopback and never touches the LAN. Guest VLANs and AP client isolation — real mDNS
-  blockers between *devices* — are categorically inapplicable here. Only the OS can
-  break this case.
+  blockers between *devices* — are categorically inapplicable here. What that rules out is
+  everything *outside* the machine, and nothing inside it: the OS permission, the browser's
+  own mDNS responder, a stale browser process and local filtering software all remain in
+  scope, which is why the calibration below keeps more than one hypothesis open.
   Origin-scoped alternative, no System Settings needed: allow camera + microphone for
   `http://localhost:5173` in `chrome://settings/content`, since Chrome skips mDNS
   obfuscation for origins holding media-capture permission (mechanism is consistent
@@ -163,7 +177,10 @@ handler returned 0.
 
 `chrome://webrtc-internals` is the confirming second opinion. Under the mDNS story
 there is no remote `host` row and no pair against the LAN address at all — only pairs
-against the remote `srflx`, `requestsSent` climbing and `responsesReceived` at 0. A
+against the remote `srflx`, `requestsSent` climbing and `responsesReceived` at 0. That
+shape is what the real-ICE canary in `post-mortem.spec.ts` reproduces and measures: one
+unresolvable `.local` plus one blackholed routable candidate, and the sampler reports a
+live pair and `remote-hosts:0` in the same snapshot. A
 pair against the LAN address in state `failed` means something else: local-subnet
 unicast blocked rather than name resolution, same fix but a different claim.
 

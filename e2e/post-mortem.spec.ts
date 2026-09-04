@@ -5,9 +5,9 @@ import { expect, test, type Page } from '@playwright/test';
 // every cause -- advice that, for a blocked path, reproduces the failure exactly.
 //
 // Almost none of this needs a real 15 s ICE timeout: the post-mortem is a pure
-// function of (remote SDP, getStats() report), and both are supplied here. Only the
-// last test pays for a real one, because it is the only claim about Chromium rather
-// than about our own logic.
+// function of (remote SDP, getStats() report, what this session had already reached), and
+// all three are supplied here. Only the last test pays for a real one, because it is the
+// only claim about Chromium rather than about our own logic.
 
 type Fixture = [string, Record<string, unknown>][];
 
@@ -56,6 +56,9 @@ const MDNS_HOST = (uuid: string): string =>
   `a=candidate:1 1 udp 2113937151 ${uuid}.local 50000 typ host generation 0 network-cost 999`;
 const IP_HOST =
   'a=candidate:2 1 udp 2113937150 192.0.2.1 50001 typ host generation 0 network-cost 999';
+/** Routable, answered by nothing (TEST-NET-1): a pair forms against it and then times out. */
+const SRFLX_BLACKHOLE =
+  'a=candidate:3 1 udp 1677729535 192.0.2.1 50002 typ srflx raddr 0.0.0.0 rport 0 generation 0 network-cost 999';
 
 /**
  * A crafted offer into a real answerer, so currentRemoteDescription is exactly
@@ -89,7 +92,7 @@ const PAIR = (extra: Record<string, unknown>): Record<string, unknown> => ({
   requestsSent: 9, requestsReceived: 0, responsesReceived: 0, ...extra,
 });
 
-test('names mDNS when the peer\'s .local candidates never became remote candidates', async ({ browser }) => {
+test('names mDNS when no pair was ever formed against the peer\'s .local candidates', async ({ browser }) => {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   const donor = await ctx.newPage();
@@ -106,10 +109,16 @@ test('names mDNS when the peer\'s .local candidates never became remote candidat
   await answererWith(page, donor, [MDNS_HOST(uuid)]);
   await synthesizeFailure(page);
 
-  await expect(page.getByTestId('wire-log')).toContainText('never resolved');
+  // The claim is pair absence, and the cause is RANKED rather than asserted: getStats
+  // cannot distinguish a name that never resolved from one that resolved to an address
+  // nothing here could pair with.
+  await expect(page.getByTestId('wire-log')).toContainText('no candidate pair was ever formed against');
+  await expect(page.getByTestId('wire-log')).toContainText('leading suspect');
+  await expect(page.getByTestId('wire-log')).not.toContainText('never resolved —');
   await expect(page.getByTestId('wire-log')).toContainText('Local Network');
   await expect(page.getByTestId('wire-log')).toContainText('mdns-offered:1');
   await expect(page.getByTestId('wire-log')).toContainText('udp-host-pairs:0');
+  await expect(page.getByTestId('wire-log')).toContainText('remote-hosts:0');
   // Real provenance, read from local-candidate.url rather than asserted.
   await expect(page.getByTestId('wire-log')).toContainText('stun:stun.l.google.com:19302');
   // The whole point of the change: the old blanket advice must not be the verdict.
@@ -133,7 +142,7 @@ test('names silence, not mDNS, when the peer offered a routable candidate', asyn
 
   await expect(page.getByTestId('wire-log')).toContainText('9 connectivity checks were sent and none came back');
   await expect(page.getByTestId('wire-log')).toContainText('mdns-offered:0');
-  await expect(page.getByTestId('wire-log')).not.toContainText('never resolved');
+  await expect(page.getByTestId('wire-log')).not.toContainText('.local host candidates');
 
   await ctx.close();
 });
@@ -157,22 +166,119 @@ test('does NOT blame mDNS when a udp host pair did form', async ({ browser }) =>
 
   await expect(page.getByTestId('wire-log')).toContainText('udp-host-pairs:1');
   await expect(page.getByTestId('wire-log')).toContainText('mdns-offered:1');
-  await expect(page.getByTestId('wire-log')).not.toContainText('never resolved');
+  await expect(page.getByTestId('wire-log')).not.toContainText('.local host candidates');
 
   await ctx.close();
 });
 
-test('a real ICE failure still reports its candidate pairs', async ({ browser }) => {
-  // The one claim the fixtures cannot make, because it is about Chromium and not
-  // about our logic: that §8's sampler really does capture a pair from a real ICE
-  // failure. Note what it does NOT assert -- pairs do not survive to the 'failed'
-  // event. Measured on this host: the 1 s sampler saw 1 pair on all 15 ticks while
-  // a getStats() read from inside the 'failed' handler returned 0, because libwebrtc
-  // tears down write-timed-out connections as it reports failed. That is the whole
-  // reason §8 samples instead of reading once; a naive read would see no pairs, and
-  // 'udp-host-pairs:0' would then be trivially true on EVERY failure, firing the
-  // mDNS verdict at operators whose multicast is fine. If this goes red with
-  // pairs:0, the sampler has stopped working and that false positive is back.
+test('does NOT blame mDNS when the pair exists but this side is not reported as host', async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const donor = await ctx.newPage();
+
+  // udp-host-pairs cannot carry the verdict alone, because the LOCAL candidate's reported
+  // type is not stable: Connection::MaybeUpdateLocalCandidate rewrites it to srflx or prflx
+  // when a check's mapped address differs from the port's own. That drops a pair mDNS had
+  // demonstrably built out of the counter -- but the remote side still reads 'host', which
+  // is why remote-hosts is in the gate.
+  await install(page, [
+    ['P', PAIR({})],
+    ['L', { type: 'local-candidate', candidateType: 'prflx', protocol: 'udp' }],
+    ['R', { type: 'remote-candidate', candidateType: 'host', protocol: 'udp' }],
+  ]);
+  await answererWith(page, donor, [MDNS_HOST('4f1a2c3d-2222-4000-8000-abcdef123456')]);
+  await synthesizeFailure(page);
+
+  await expect(page.getByTestId('wire-log')).toContainText('udp-host-pairs:0');
+  await expect(page.getByTestId('wire-log')).toContainText('remote-hosts:1');
+  await expect(page.getByTestId('wire-log')).not.toContainText('.local host candidates');
+  // and it still says the thing that IS true about this snapshot
+  await expect(page.getByTestId('error')).toContainText('none came back');
+
+  await ctx.close();
+});
+
+test('a succeeded pair without a connected ICE is reported as historical', async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const donor = await ctx.newPage();
+
+  // 'succeeded' in a retained sample is a reading of an earlier moment, not of the state at
+  // 'failed'. Saying "ICE found a path, so the failure is after it" from this alone rules
+  // ICE out on evidence that cannot rule it out -- a path found and then lost before DTLS
+  // finished leaves exactly this trace.
+  await install(page, [
+    ['P', PAIR({ state: 'succeeded' })],
+    ['L', { type: 'local-candidate', candidateType: 'host', protocol: 'udp' }],
+    ['R', { type: 'remote-candidate', candidateType: 'host', protocol: 'udp' }],
+  ]);
+  await answererWith(page, donor, [IP_HOST]);
+  await synthesizeFailure(page);
+
+  await expect(page.getByTestId('wire-log')).toContainText('had reached succeeded in an earlier sample');
+  await expect(page.getByTestId('wire-log')).toContainText('may simply have gone away');
+  await expect(page.getByTestId('wire-log')).not.toContainText('ICE reported connected');
+
+  await ctx.close();
+});
+
+test('a session that had an open channel is diagnosed as path loss, not as DTLS or SCTP', async ({ browser }) => {
+  const ctxA = await browser.newContext();
+  const ctxB = await browser.newContext();
+  const A = await ctxA.newPage();
+  const B = await ctxB.newPage();
+
+  // The one case the fixtures cannot reach on their own: a real handshake that reached
+  // channel:open, and only then failed. This fixture is what the previous revision read as
+  // two independent proofs about a handshake -- a succeeded pair ("whatever failed is after
+  // ICE, so DTLS or SCTP") and no pair against B's real .local host candidates ("their names
+  // never resolved, check Local Network"). Both are false once the channel has been open:
+  // DTLS and SCTP demonstrably finished, and mDNS demonstrably stopped nothing.
+  await install(A, [
+    ['P', PAIR({ state: 'succeeded' })],
+    ['L', { type: 'local-candidate', candidateType: 'host', protocol: 'udp' }],
+    ['R', { type: 'remote-candidate', candidateType: 'srflx', protocol: 'udp' }],
+  ]);
+  await A.goto('/');
+  await B.goto('/');
+
+  await A.getByTestId('create-offer').click();
+  await expect(A.getByTestId('signal-phase')).toHaveText('offer-ready');
+  await B.getByTestId('remote-blob').fill(await A.getByTestId('local-blob').inputValue());
+  await B.getByTestId('accept').click();
+  await expect(B.getByTestId('signal-phase')).toHaveText('answer-ready');
+  await A.getByTestId('remote-blob').fill(await B.getByTestId('local-blob').inputValue());
+  await A.getByTestId('accept').click();
+  await expect(A.getByTestId('diag')).toContainText('channel:open');
+
+  await synthesizeFailure(A);
+
+  await expect(A.getByTestId('error')).toContainText('the path went away');
+  await expect(A.getByTestId('wire-log')).not.toContainText('DTLS or SCTP');
+  await expect(A.getByTestId('wire-log')).not.toContainText('.local host candidates');
+  // Reset IS the right advice here, and this is the only branch that gives it.
+  await expect(A.getByTestId('error')).toContainText('Press Reset in both tabs');
+
+  await ctxA.close();
+  await ctxB.close();
+});
+
+test('a real ICE failure: the sampler keeps its pair, and an unresolvable .local never becomes one', async ({ browser }) => {
+  // The claims the fixtures cannot make, because they are about Chromium and not about our
+  // logic. The remote candidates mirror the real failure this section was written for: one
+  // .local name nothing can resolve, plus a routable candidate that answers nothing.
+  //
+  // 1. §8's sampler really does capture a pair from a real ICE failure. Note what this does
+  //    NOT assert -- that pairs survive to the 'failed' event. Measured on this host: the
+  //    1 s sampler saw 1 pair on all 15 ticks while a getStats() read from inside the
+  //    'failed' handler returned 0, because libwebrtc tears down write-timed-out
+  //    connections as it reports failed. That is the whole reason §8 samples instead of
+  //    reading once; a naive read would see no pairs, and every counter in the gate would
+  //    be trivially 0 on EVERY failure, firing the mDNS verdict at operators whose
+  //    multicast is fine. If this goes red with pairs:0, that false positive is back.
+  // 2. remote-hosts:0 next to a live pair is a real reading and not an artefact of an empty
+  //    report -- the srflx pair is there, in the same snapshot, and the .local one is not.
+  //    This is what licenses gating the mDNS finding on it.
   test.skip(test.info().project.name !== 'chromium', 'libwebrtc-level behaviour; ~15 s of real ICE');
   test.setTimeout(60_000);
 
@@ -181,13 +287,17 @@ test('a real ICE failure still reports its candidate pairs', async ({ browser })
   const donor = await ctx.newPage();
 
   await install(page); // no fixture: real getStats()
-  await answererWith(page, donor, [IP_HOST]); // routable, blackholed -> a pair forms, then times out
+  await answererWith(page, donor, [MDNS_HOST('4f1a2c3d-3333-4000-8000-abcdef123456'), SRFLX_BLACKHOLE]);
 
   await expect(page.getByTestId('wire-log')).toContainText('post-mortem —', { timeout: 40_000 });
   const evidence = await page.getByTestId('wire-log').innerText();
   const pairs = /post-mortem — pairs:(\d+)/.exec(evidence);
   expect(pairs, 'the post-mortem never printed its evidence line').not.toBeNull();
   expect(Number(pairs?.[1]), 'no candidate pair survived to the failed event — see §8').toBeGreaterThan(0);
+  // The true positive, end to end in a real browser rather than from a fixture.
+  await expect(page.getByTestId('wire-log')).toContainText('remote-hosts:0');
+  await expect(page.getByTestId('wire-log')).toContainText('mdns-offered:1');
+  await expect(page.getByTestId('error')).toContainText('no candidate pair was ever formed against');
 
   await ctx.close();
 });
