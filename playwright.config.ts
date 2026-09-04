@@ -49,8 +49,9 @@ export default defineConfig({
   // up for the live walkthrough.
   //
   // CI runs `--project=pages-build` (.github/workflows/deploy-pages.yml), so part of this
-  // suite IS a CI gate now. The three chromium-only specs -- ice-timeout, post-mortem,
-  // answerer-clock, ~1 min 45 s of deliberate waits -- stay local.
+  // suite IS a CI gate now. Everything else stays local: the chromium-only specs --
+  // ice-timeout, post-mortem, answerer-clock, ~1 min 45 s of deliberate waits -- and
+  // routable-blob and ice-config, which are fast but make no claim about the built bundle.
   //
   // Both servers start on every run, because Playwright starts every webServer entry
   // regardless of --project. So `npm run test:e2e` now also pays one `vite build`.

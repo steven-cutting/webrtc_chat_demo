@@ -7,8 +7,15 @@
 # Typecheck and build alone cannot do that -- a logic change that breaks the handshake
 # still typechecks and bundles.
 #
-# What is still local-only: the three chromium-only specs -- ice-timeout, post-mortem,
-# answerer-clock -- which spend ~1 min 45 s on deliberate waits.
+# What is still local-only: the chromium-only specs -- ice-timeout, post-mortem,
+# answerer-clock -- which spend ~1 min 45 s on deliberate waits, plus routable-blob and
+# ice-config, which are fast but say nothing about the built bundle.
+#
+# Worth stating because a relay is configurable now: this gate needs no ICE server to pass.
+# It runs the app's default configuration, so a STUN request does go out -- but the handshake
+# completes over loopback host candidates whether or not it is answered. And no test anywhere
+# in this repo depends on a TURN server answering: the only turn: URLs in the suite are routed
+# nowhere. A green run here is never evidence that relaying works.
 #
 # `pull_request` runs the same gate on the PR with the deploy job skipped, so a change to
 # this file is exercised before it can publish anything. Note what that leaves unexercised:

@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
-import { installPc, IP_HOST, IP_HOST6, MDNS_HOST, SRFLX, SRFLX6, SRFLX_BLACKHOLE, UDP_HOST } from './pc';
+import {
+  DEAD_TURN, installPc, IP_HOST, IP_HOST6, MDNS_HOST, RELAY, SRFLX, SRFLX6, SRFLX_BLACKHOLE, UDP_HOST,
+} from './pc';
 
 // The getStats() post-mortem in src/main.ts §8. It replaces one fixed sentence
 // ("Press Reset in both tabs and redo the exchange") that used to be printed under
@@ -239,6 +241,14 @@ test('names the relay-shaped failure when both ends published reflexive candidat
   // What is actually missing, said plainly, plus the one workaround that does not need it.
   await expect(page.getByTestId('error')).toContainText('a TURN relay is what is missing');
   await expect(page.getByTestId('error')).toContainText('put both devices on the same network');
+  // And it must now say what to DO about that, because a relay can be configured here. The old
+  // tail was a claim about the BUILD -- "this demo deliberately has none" -- and the build can have
+  // one, so it is false in every branch after this change and not only in a configured tab.
+  // Asserted as an absence: a positive assertion on the new wording would still pass if the old
+  // sentence merely survived alongside it.
+  await expect(page.getByTestId('error')).not.toContainText('this demo deliberately has none');
+  await expect(page.getByTestId('error')).toContainText('none is configured in this tab');
+  await expect(page.getByTestId('wire-log')).toContainText('relay-cfg:0');
   // Reset is not the remedy for a blocked path; it is the action that reproduces it.
   await expect(page.getByTestId('error')).not.toContainText('Press Reset in both tabs');
 
@@ -523,6 +533,119 @@ test('a real ICE failure: the sampler keeps its pair, and an unresolvable .local
   await expect(page.getByTestId('wire-log')).toContainText('remote-hosts:0');
   await expect(page.getByTestId('wire-log')).toContainText('mdns-offered:1');
   await expect(page.getByTestId('error')).toContainText('no candidate pair was ever formed against');
+
+  await ctx.close();
+});
+
+test('names the ICE server a candidate really came from once, not twice', async ({ browser }) => {
+  // The label was 'stun:' and the value is local-candidate.url verbatim, so the evidence line has
+  // been printing 'stun:stun:stun.l.google.com:19302' -- it is in the bug report that started this
+  // work. With a relay configurable the label would also be wrong as often as it is doubled.
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const donor = await ctx.newPage();
+
+  await installPc(page, { stats: [
+    ['P', PAIR({})],
+    ['L', { type: 'local-candidate', candidateType: 'srflx', protocol: 'udp', url: 'stun:stun.l.google.com:19302' }],
+    ['R', { type: 'remote-candidate', candidateType: 'srflx', protocol: 'udp' }],
+  ] });
+  await answererWith(page, donor, [IP_HOST]);
+  await synthesizeFailure(page);
+
+  await expect(page.getByTestId('wire-log')).toContainText('via:stun:stun.l.google.com:19302');
+  await expect(page.getByTestId('wire-log')).not.toContainText('stun:stun:stun.l.google.com');
+
+  await ctx.close();
+});
+
+test('a relay that gathered nothing leads the verdict, ahead of the topology reading', async ({ browser }) => {
+  // The operator's second attempt: they read the last post-mortem, configured a relay, and it
+  // produced nothing. That outranks a cross-network reading they have already seen -- they turned
+  // a knob to fix this and the knob did nothing, and no other finding says so.
+  //
+  // Deliberately NOT a branch inside the cross-network verdict: that one is gated on both ends
+  // having a reflexive candidate, so under Force relay -- the mode that exists to prove a relay --
+  // it can never run, which is exactly when this needs to be said.
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const donor = await ctx.newPage();
+
+  await installPc(page, {
+    config: { iceServers: [DEAD_TURN] },
+    stats: [
+      ['P', PAIR({})],
+      ['L', { type: 'local-candidate', candidateType: 'srflx', protocol: 'udp', url: 'stun:stun.l.google.com:19302' }],
+      ['R', { type: 'remote-candidate', candidateType: 'srflx', protocol: 'udp' }],
+    ],
+    localCandidates: [UDP_HOST, SRFLX('203.0.113.9')],
+  });
+  await answererWith(page, donor, [MDNS_HOST('4f1a2c3d-7777-4000-8000-abcdef123456'), SRFLX('198.51.100.7')]);
+  await synthesizeFailure(page);
+
+  await expect(page.getByTestId('wire-log')).toContainText('relay-cfg:1 local-relay:0 remote-relay:0');
+  await expect(page.getByTestId('error')).toContainText('this side gathered no relay candidate');
+  await expect(page.getByTestId('error')).toContainText('turn:198.51.100.1:3478');
+  // Ranked ahead of the cross-network verdict, which is still true and still logged.
+  await expect(page.getByTestId('error')).not.toContainText('reflected to different public addresses');
+  await expect(page.getByTestId('wire-log')).toContainText('reflected to different public addresses');
+
+  await ctx.close();
+});
+
+test('when both ends relayed and it still failed, it says what it cannot tell you', async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const donor = await ctx.newPage();
+
+  await installPc(page, {
+    config: { iceServers: [DEAD_TURN] },
+    stats: [
+      ['P', PAIR({})],
+      ['L', { type: 'local-candidate', candidateType: 'relay', protocol: 'udp', url: 'turn:198.51.100.1:3478' }],
+      ['R', { type: 'remote-candidate', candidateType: 'srflx', protocol: 'udp' }],
+    ],
+    localCandidates: [UDP_HOST, RELAY],
+  });
+  await answererWith(page, donor, [RELAY]);
+  await synthesizeFailure(page);
+
+  await expect(page.getByTestId('wire-log')).toContainText('local-relay:1 remote-relay:1');
+  await expect(page.getByTestId('error')).toContainText('both ends published relay candidates');
+  // A relayed address does not depend on either NAT's mapping, so the two readings the
+  // cross-network verdict ranks are not the ones that fit here -- and what IS left is not
+  // separable from a stats report. Saying so is the honest end of it.
+  await expect(page.getByTestId('error')).toContainText('not the readings that fit');
+  await expect(page.getByTestId('error')).toContainText("the relay's own logs");
+  await expect(page.getByTestId('error')).not.toContainText('symmetric');
+
+  await ctx.close();
+});
+
+test('under Force relay it does not report the policy working as a network fault', async ({ browser }) => {
+  // Force relay suppresses host and reflexive candidates by design, so "everything it published
+  // was a LAN address -- the ice candidate error lines above say what happened to STUN" would be a
+  // verdict about a session that published no LAN address and used no STUN. Reachable: a clean
+  // gathering completion publishes with no zero-candidate check.
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const donor = await ctx.newPage();
+
+  await installPc(page, {
+    config: { iceTransportPolicy: 'relay', iceServers: [DEAD_TURN] },
+    stats: [['P', PAIR({})]],
+    localCandidates: [UDP_HOST],
+  });
+  await answererWith(page, donor, [IP_HOST]);
+  await synthesizeFailure(page);
+
+  await expect(page.getByTestId('wire-log')).toContainText('policy:relay');
+  await expect(page.getByTestId('wire-log')).not.toContainText('everything it published was a LAN address');
+  // The findings that ARE true about this snapshot still fire. The headline is the relay one --
+  // Force relay with a relay that never allocated is precisely "the thing meant to bridge them
+  // published no address" -- and the silence finding is logged behind it.
+  await expect(page.getByTestId('error')).toContainText('this side gathered no relay candidate');
+  await expect(page.getByTestId('wire-log')).toContainText('none came back');
 
   await ctx.close();
 });

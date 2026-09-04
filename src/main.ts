@@ -1,4 +1,8 @@
 import { asEnvelope, describe, type Envelope, type Role } from './protocol';
+import {
+  buildFragment, iceUrls, readIceConfig, relayHosts, relayUrls,
+  type IceConfig,
+} from './ice-config';
 
 // ── §1 state, DOM refs, wants() ────────────────────────────────────────────
 
@@ -12,6 +16,17 @@ type Phase =
 // only completes at ~39.9 s -- with a candidate set identical to the one it
 // already had at 3 s. So 3000 ms costs nothing when STUN works and saves ~37 s
 // of dead waiting when it does not.
+//
+// "Every configuration tried" is a smaller set than the configurations this app can run in,
+// now that a relay can be configured. A relay candidate is not one more round trip on the STUN
+// transaction -- it is its own Allocate, which the long-term credential mechanism normally
+// answers with a challenge the client has to re-send against, and a turns: URL puts TCP and TLS
+// handshakes in front of all of that. That is a reading of the mechanism; how long it costs from
+// this host has never been timed here, so this constant is left where the measurement put it
+// rather than raised to a number nobody measured. What the relay case gets instead is a specific
+// marker: reachMarker() says a relay candidate has not arrived yet while gathering runs, and NO
+// RELAY once it has stopped -- and the existing refresh path still republishes a complete blob if
+// the allocation lands late.
 const ICE_GATHER_TIMEOUT_MS = 3000;
 
 let phase: Phase = 'idle';
@@ -20,6 +35,13 @@ let dc: RTCDataChannel | null = null;
 let seq = 0;
 /** True while the published blob is the partial snapshot taken at the gathering timeout. */
 let provisional = false;
+/**
+ * Latched: this blob was published while gathering was still running, at least once. `provisional`
+ * itself clears when gathering completes, and by the time §8 runs it always has -- but the copy the
+ * peer actually received was taken before that, which is the whole point of the caveat that reads
+ * this.
+ */
+let wasProvisional = false;
 /** Post-mortem state; see §8. Declared here so no listener can hit a TDZ. */
 let lastSample: Snapshot | null = null;
 let sampler: number | undefined;
@@ -32,6 +54,8 @@ let explained = false;
  */
 let iceEverConnected = false;
 let everOpen = false;
+/** ICE server URLs that raised an icecandidateerror, so §8 can say whether one was reported. */
+const iceErrorUrls = new Set<string>();
 
 const el = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
@@ -40,6 +64,14 @@ const ui = {
   phase: el<HTMLSpanElement>('signal-phase'),
   reset: el<HTMLButtonElement>('reset'),
   diag: el<HTMLParagraphElement>('diag'),
+  iceCard: el<HTMLDetailsElement>('ice-card'),
+  iceStatus: el<HTMLSpanElement>('ice-status'),
+  iceUrls: el<HTMLTextAreaElement>('ice-urls'),
+  iceUsername: el<HTMLInputElement>('ice-username'),
+  iceCredential: el<HTMLInputElement>('ice-credential'),
+  iceRelayOnly: el<HTMLInputElement>('ice-relay-only'),
+  iceApply: el<HTMLButtonElement>('ice-apply'),
+  iceLink: el<HTMLButtonElement>('ice-link'),
   createOffer: el<HTMLButtonElement>('create-offer'),
   localCard: el<HTMLDivElement>('local-card'),
   localLabel: el<HTMLHeadingElement>('local-label'),
@@ -68,9 +100,38 @@ function wants(): 'offer' | 'answer' | null {
 
 // ── §2 the peer connection ─────────────────────────────────────────────────
 
-const pc = new RTCPeerConnection({
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-});
+// The configuration is read from location.hash BEFORE this line, because pc is built once, at
+// module scope, and every listener below captures it -- so a configuration change lands only on a
+// reload. Reset is already location.reload(), and a reload preserves the fragment, which is what
+// makes an invite link survive it (asserted in e2e/ice-config.spec.ts rather than recalled).
+// The panel that writes the fragment is §12.
+const { pc, ice } = openPeerConnection(readIceConfig(location.hash));
+
+/**
+ * A throw from `new RTCPeerConnection` at module scope is not an error message -- it is a blank
+ * page: no listener below is registered, render() never runs, the diagnostics strip stays empty and
+ * every control is dead, delivered by a link someone else wrote. readIceConfig() validates, and
+ * this catches what the validation missed. The fallback is the built-in configuration, which is the
+ * one this repo has actually run.
+ */
+function openPeerConnection(want: IceConfig): { pc: RTCPeerConnection; ice: IceConfig } {
+  try {
+    return { pc: new RTCPeerConnection(want.rtc), ice: want };
+  } catch (err) {
+    const safe = readIceConfig('');
+    safe.notes = [...want.notes,
+      `the browser refused that ICE configuration (${reason(err)}) — falling back to the built-in STUN server`];
+    return { pc: new RTCPeerConnection(safe.rtc), ice: safe };
+  }
+}
+
+/**
+ * What the RUNNING connection is configured with, which is not always what the parser produced: the
+ * fallback above rewrites it, and a test can hand the engine a configuration the app never parsed.
+ * Every claim this page makes about the connection reads from here; `ice` is used only for
+ * provenance -- the log lines, and whether the panel starts open.
+ */
+const applied = (): RTCConfiguration => pc.getConfiguration();
 
 // Registered unconditionally: it simply never fires for the offerer, which is
 // the role asymmetry expressed by execution rather than by a comment.
@@ -123,8 +184,16 @@ pc.addEventListener('icecandidateerror', (ev) => {
   // implementation does. What WAS seen on this host is narrower: one 701 for
   // stun.l.google.com in a run that still published a working srflx candidate -- which is
   // why the candidate count publish() logs a moment later is the actual check.
+  if (typeof e.url === 'string') iceErrorUrls.add(e.url);
   if (e.errorCode === 701) {
     log('event', '↳ 701 = no host candidate could reach that server; the errorText above says which failure, the candidate count below is the check');
+  } else if (/^turns?:/i.test(e.url ?? '')) {
+    // Distinguished by SCHEME and nothing else. No table: a relay answering and a relay refusing
+    // can carry the same code -- a 401 is the ordinary first step of the long-term credential
+    // handshake as well as a rejection -- and which of those this engine surfaces has not been
+    // measured here. The errorText above is the engine's own words, and the relay count in the
+    // publish line below is the check.
+    log('event', '↳ that code came from the relay itself; the errorText above is its own words, and the relay candidate count below is the check');
   }
 });
 
@@ -279,6 +348,7 @@ async function gatherAndPublish(ready: Phase): Promise<void> {
   // Gathering is still running. Registered before publish() so the refresh path
   // reads in the order it happens.
   provisional = true;
+  wasProvisional = true;
   const onComplete = (): void => {
     if (pc.iceGatheringState !== 'complete') return;
     pc.removeEventListener('icegatheringstatechange', onComplete);
@@ -312,7 +382,14 @@ async function gatherAndPublish(ready: Phase): Promise<void> {
     // it 'ready' hands the operator a blob that is guaranteed to fail, so stay
     // in 'gathering' -- where every control is already disabled -- and say so.
     // If gathering finishes later, onComplete above still recovers the flow.
-    fail('No ICE candidates yet, so there is nothing to copy. If none arrive, press Reset and check the network.');
+    // Under Force relay the network is the wrong thing to check: that policy gathers nothing but
+    // relayed candidates, so a relay that will not allocate leaves exactly zero -- which is the
+    // shape ice-timeout.spec.ts drives. The prefix is unchanged; only the action after it moves.
+    fail(applied().iceTransportPolicy === 'relay'
+      ? 'No ICE candidates yet, so there is nothing to copy. Force relay is on, so check the relay '
+        + 'before the network: that policy gathers nothing else, and a relay that will not allocate '
+        + 'leaves exactly this.'
+      : 'No ICE candidates yet, so there is nothing to copy. If none arrive, press Reset and check the network.');
     return;
   }
 
@@ -334,8 +411,8 @@ function publish(): void {
     log('event', 'host candidates are mDNS-obfuscated — the peer must resolve them over multicast DNS');
   }
   if (!provisional && !canLeaveLan(c)) {
-    log('event', 'no server-reflexive candidate and no routable host candidate — this blob can only ' +
-      'reach a peer on this network');
+    log('event', 'no server-reflexive candidate, no relay candidate and no routable host address — ' +
+      'this blob can only reach a peer on this network');
   }
   render();
 }
@@ -367,14 +444,33 @@ function renderBlobMeta(): void {
  * and calling that blob LAN-only would be a verdict on a set that is not final yet.
  */
 function reachMarker(c: Candidates): string {
-  if (provisional) {
-    return canLeaveLan(c)
+  // Two independent readings, so they compose rather than shadow each other: a blob can be
+  // perfectly able to leave this LAN by way of a srflx candidate AND be missing the relay that was
+  // configured to carry it. That second case prints nothing at all under the old early-return --
+  // canLeaveLan() is already true -- and it is exactly the shape a cross-network failure takes.
+  const lan = provisional
+    ? (canLeaveLan(c)
       ? ' · PARTIAL — still gathering, copy again when this clears'
-      : ' · PARTIAL — still gathering, no server-reflexive or routable candidate yet, copy again when this clears';
-  }
-  return canLeaveLan(c)
-    ? ''
-    : ' · LAN ONLY — every candidate here is a LAN address, so this blob can only reach a peer on this network';
+      : ' · PARTIAL — still gathering, no server-reflexive or routable candidate yet, copy again when this clears')
+    : (canLeaveLan(c)
+      ? ''
+      : ' · LAN ONLY — every candidate here is a LAN address, so this blob can only reach a peer on this network');
+  return `${lan}${relayMarker(c)}`;
+}
+
+/**
+ * A relay is configured and produced nothing.
+ *
+ * Silent while provisional, for the same reason LAN ONLY is: an allocation may still be seconds
+ * away, and calling it missing would be a verdict on a set that is not final. Read from the RUNNING
+ * configuration, not the parsed one -- what matters is what the engine was asked for.
+ */
+function relayMarker(c: Candidates): string {
+  if (c.relay > 0 || relayUrls(applied()).length === 0) return '';
+  return provisional
+    ? ' · no relay candidate yet'
+    : ' · NO RELAY — a relay is configured but produced no candidate, so this blob does not carry '
+      + 'one; the ice candidate error lines in the log are what to read';
 }
 
 interface Candidates {
@@ -389,6 +485,16 @@ interface Candidates {
   udpHosts: number;
   /** `typ srflx` lines. NOT on its own the answer to "can this leave the LAN" -- canLeaveLan(). */
   srflx: number;
+  /**
+   * `typ relay` lines: addresses a TURN server allocated for this side. Counted rather than read
+   * off byType because three readers arrived at once -- the NO RELAY marker, the evidence line and
+   * the finding in §8 -- and all three ask about relays specifically.
+   *
+   * Zero here does NOT mean no relay is configured. That question is answered by the RUNNING
+   * configuration, relayUrls(applied()), and the interesting case is the two together: a relay
+   * configured and nothing gathered from it.
+   */
+  relay: number;
   /**
    * The mapped addresses of those lines: this side as the STUN server saw it. Comparing the
    * two ends' sets is the only thing separating a broken multicast stack from a cross-network
@@ -453,11 +559,13 @@ function classifyAddress(address: string | undefined): { family: 'v4' | 'v6' | n
 
 /**
  * Whether this description can reach a peer that is NOT on this network. Three ways in, and
- * an earlier revision counted only the first: a server-reflexive candidate, a relay (none
- * here -- no TURN is configured, so this term can never fire today and is written for the
- * reading rather than for the branch), or a host candidate at a routable literal, which
- * needs no srflx and is not issued one. Raised in review, and correct: `srflx === 0` alone
- * marked usable blobs unusable.
+ * an earlier revision counted only the first: a server-reflexive candidate, a relay, or a host
+ * candidate at a routable literal, which needs no srflx and is not issued one. Raised in
+ * review, and correct: `srflx === 0` alone marked usable blobs unusable.
+ *
+ * The relay term was written before a relay could exist here -- for the reading rather than for
+ * the branch. A relay is configurable now, so the branch arrived, and it needed no change to
+ * take it.
  */
 function canLeaveLan(c: Candidates): boolean {
   return c.srflx > 0 || (c.byType.get('relay') ?? 0) > 0 || c.routableHosts > 0;
@@ -471,6 +579,7 @@ function countCandidates(sdp: string): Candidates {
   let mdnsHosts = 0;
   let udpHosts = 0;
   let srflx = 0;
+  let relay = 0;
   const srflxAddresses: string[] = [];
   const srflxFamilies = new Set<'v4' | 'v6'>();
   let routableHosts = 0;
@@ -493,9 +602,14 @@ function countCandidates(sdp: string): Candidates {
       if (transport === 'udp') udpHosts++;
     }
     // Field [4] of a srflx line is the MAPPED address, not the local one -- the local one
-    // is in raddr further along. `relay` is deliberately absent: with no TURN configured
-    // nothing here can produce one, and counting a type that cannot occur would be an
-    // abstraction ahead of a use.
+    // is in raddr further along. Field [4] of a relay line is the address the TURN server
+    // ALLOCATED, which is why relay addresses are counted and deliberately NOT admitted to
+    // srflxAddresses: two peers using the same relay are allocated addresses at the same host, so
+    // feeding those into the comparison below would read as nets:same for two peers on opposite
+    // sides of the planet. (This counter used to be absent, annotated "counting a type that cannot
+    // occur would be an abstraction ahead of a use". A relay is configurable now, so it can occur,
+    // and the use arrived with it.)
+    if (m?.[1] === 'relay') relay++;
     if (m?.[1] === 'srflx' && address) {
       srflx++;
       if (!srflxAddresses.includes(address)) srflxAddresses.push(address);
@@ -504,7 +618,7 @@ function countCandidates(sdp: string): Candidates {
   }
   const total = lines.length;
   const base = {
-    total, mdns, byType, mdnsHosts, udpHosts, srflx, srflxAddresses, srflxFamilies,
+    total, mdns, byType, mdnsHosts, udpHosts, srflx, relay, srflxAddresses, srflxFamilies,
     routableHosts, families, unknownFamily,
   };
   if (total === 0) return { ...base, summary: 'no candidates' };
@@ -538,11 +652,17 @@ interface Snapshot {
   udpHostPairs: number;
   remoteHosts: number;
   succeeded: number;
+  /**
+   * Candidate pairs with a relayed address at either end. The only thing separating "the relay
+   * candidates were in the descriptions and ICE never paired them" from "the pairs existed and the
+   * path did not" -- two different next actions.
+   */
+  relayPairs: number;
   requestsSent: number;
   requestsReceived: number;
   responsesReceived: number;
   /** local-candidate.url -- the ICE server a srflx/relay candidate really came from. */
-  stunUrls: string[];
+  serverUrls: string[];
 }
 
 type Stat = Record<string, unknown>;
@@ -571,8 +691,8 @@ async function sample(): Promise<void> {
   report.forEach((stat, id) => { byId.set(id, stat as Stat); });
 
   const snap: Snapshot = {
-    pairs: 0, udpHostPairs: 0, remoteHosts: 0, succeeded: 0,
-    requestsSent: 0, requestsReceived: 0, responsesReceived: 0, stunUrls: [],
+    pairs: 0, udpHostPairs: 0, remoteHosts: 0, succeeded: 0, relayPairs: 0,
+    requestsSent: 0, requestsReceived: 0, responsesReceived: 0, serverUrls: [],
   };
 
   for (const stat of byId.values()) {
@@ -596,6 +716,9 @@ async function sample(): Promise<void> {
           && remote?.protocol === 'udp') {
         snap.udpHostPairs++;
       }
+      // Either end: one relayed address is enough to make a pair a relayed pair, and one working
+      // relay is normally enough for a session.
+      if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') snap.relayPairs++;
     } else if (stat.type === 'remote-candidate') {
       // Pair-derived, despite the name: Chrome produces a remote-candidate row only from
       // a live connection (ProduceIceCandidateStats is called with is_local=false only
@@ -605,8 +728,8 @@ async function sample(): Promise<void> {
       // more.
       if (stat.candidateType === 'host') snap.remoteHosts++;
     } else if (stat.type === 'local-candidate') {
-      if (typeof stat.url === 'string' && !snap.stunUrls.includes(stat.url)) {
-        snap.stunUrls.push(stat.url);
+      if (typeof stat.url === 'string' && !snap.serverUrls.includes(stat.url)) {
+        snap.serverUrls.push(stat.url);
       }
     }
   }
@@ -648,6 +771,10 @@ async function explainFailure(): Promise<void> {
 
     const remote = countCandidates(pc.currentRemoteDescription?.sdp ?? '');
     const local = countCandidates(pc.localDescription?.sdp ?? '');
+    // The RUNNING configuration, not the parsed one. Every claim below about what this session was
+    // asked to do reads from here.
+    const cfg = applied();
+    const relays = relayUrls(cfg);
 
     // The comparison getStats() cannot make. A .local name that never became a pair looks
     // identical whether multicast is broken on one LAN or the peer is simply somewhere
@@ -698,9 +825,19 @@ async function explainFailure(): Promise<void> {
       `local-udp-hosts:${local.udpHosts} ` +
       `local-srflx:${local.srflx} remote-srflx:${remote.srflx} nets:${nets} ` +
       `families:${familyLabel(local)}|${familyLabel(remote)} ` +
+      // Relay group. relay-cfg: counts the relay URLs the RUNNING connection holds -- what the
+      // engine was asked for, which is not always what the parser produced -- while local-relay/
+      // remote-relay count what each side actually gathered. The interesting reading is the two
+      // disagreeing.
+      `relay-cfg:${relayUrls(cfg).length} local-relay:${local.relay} remote-relay:${remote.relay} ` +
+      `relay-pairs:${snap.relayPairs} ` +
+      (cfg.iceTransportPolicy === 'relay' ? 'policy:relay ' : '') +
       `sent:${snap.requestsSent} ` +
       `recv:${snap.requestsReceived} answered:${snap.responsesReceived}` +
-      (snap.stunUrls.length ? ` stun:${snap.stunUrls.join(',')}` : '') +
+      // 'via:', not 'stun:'. The value is local-candidate.url verbatim, so the old label printed
+      // 'stun:stun:stun.l.google.com:19302' -- a doubling visible in the bug report this change
+      // came from -- and it would be plainly wrong as soon as the URL is a turn: one.
+      (snap.serverUrls.length ? ` via:${snap.serverUrls.join(',')}` : '') +
       // Public addresses, and the only place they are printed. The verdicts below say
       // "different public addresses" and leave the values here, so a log pasted into a bug
       // report can be redacted at one line rather than mid-sentence.
@@ -729,6 +866,71 @@ async function explainFailure(): Promise<void> {
     // connection ICE did complete.
     const foundAPath = iceEverConnected || snap.succeeded > 0;
 
+    /**
+     * What to say about the relay, wherever a verdict has to mention one. Three sites need it and
+     * they say structurally different things -- an address-family claim, a NAT-shape claim and a
+     * trailing caveat -- so what is shared is the STATE, not a sentence.
+     */
+    const relayAdvice = relays.length === 0
+      ? 'none is configured in this tab. Open ICE servers above and add a turn: URL with its '
+        + 'credentials, or send the other device an invite link carrying the same configuration — '
+        + 'a configuration change only takes effect on a reload, so redo the exchange from scratch '
+        + 'in both tabs afterwards. One working relay is normally enough, but two allocations fail '
+        + 'independently, so configure both ends if you can'
+      : `one is configured here (${relays.join(', ')}) and this side gathered `
+        + `${local.relay} relay candidate${local.relay === 1 ? '' : 's'} from it`;
+
+    // Leads, and deliberately ahead of every topology reading below. The operator who gets here has
+    // usually read one of those already, turned the knob it named, and the knob did nothing -- and
+    // nothing else on this list says so. It is standalone rather than a branch inside the
+    // cross-network verdict because that one needs a reflexive candidate from BOTH ends, which
+    // Force relay guarantees will not exist.
+    if (relays.length > 0 && local.relay === 0 && !foundAPath) {
+      const named = relays.filter((u) => iceErrorUrls.has(u));
+      findings.push(
+        `a relay is configured (${relays.join(', ')}) and this side gathered no relay candidate at `
+        + 'all, so the relay was never in the running — whatever else is true of the two networks, '
+        + 'the thing that was meant to bridge them published no address. '
+        + (named.length > 0
+          ? `The engine reported an ice candidate error for ${named.join(', ')}; its errorText in `
+            + 'the log above is what to read, and a wrong credential and an unreachable port look '
+            + 'alike from here.'
+          : 'No ice candidate error was reported for it either, which is the ambiguous case: on some '
+            + 'engines nothing being reported is not the same as nothing happening. An allocation '
+            + 'still in flight when the blob was published looks identical from here.')
+        + ' If the network blocks UDP to the relay port, a turn: URL with ?transport=tcp or a turns: '
+        + 'URL on 443 is the usual alternative.');
+    }
+
+    // The other half of the relay reading: it DID allocate somewhere, and it still failed.
+    if ((local.relay > 0 || remote.relay > 0) && !foundAPath) {
+      const both = local.relay > 0 && remote.relay > 0;
+      findings.push(
+        (both
+          ? 'both ends published relay candidates and the session still failed'
+          : local.relay > 0
+            ? 'this side published a relay candidate and the peer did not'
+            : 'the peer published a relay candidate and this side did not')
+        + ` — relay-pairs:${snap.relayPairs} on the evidence line above says how many candidate `
+        + 'pairs had a relayed address at either end. A relayed address does not depend on either '
+        + "NAT's mapping behaviour, so a NAT that maps per destination and a firewall that drops "
+        + 'inbound UDP are not the readings that fit this shape. '
+        + (both
+          ? 'What is left — an allocation refused on refresh, a permission never installed, a '
+            + 'credential that expired mid-session, a relay that will not forward between its own '
+            + 'allocations — is not separable from a stats report, and the relay\'s own logs are '
+            + 'the next place to look.'
+          : 'One relay candidate is normally enough, so the pair that had to work is that relayed '
+            + 'address against the other side\'s candidates; whether it was never reached or never '
+            + 'forwarded is not separable from here. If you have a relay of your own, configure it '
+            + 'too — two allocations fail independently.')
+        + (local.relay > 0 && wasProvisional
+          ? ' One thing this count cannot see: local-relay counts what this side GATHERED, not what '
+            + 'you delivered. This blob was published while gathering was still running, so a relay '
+            + 'candidate that landed after you copied it is invisible to the peer.'
+          : ''));
+    }
+
     // Provable, so it leads when it holds: with no family in common there is no address
     // the two ends share, and the absent pair follows from that alone. !foundAPath for the
     // same reason as everything below -- a dual-stack pair that connected host↔host on one
@@ -743,7 +945,9 @@ async function explainFailure(): Promise<void> {
         'on both sides, not just the reflexive ones, and neither side is hiding one behind an mDNS ' +
         'name. There is no address the two ends share, so no candidate pair could exist — this is not a ' +
         'NAT to be traversed, it is two disjoint address families. Only a relay bridges those, and ' +
-        'this demo has none; without one, both ends need a network where they have a family in common.');
+        `${relayAdvice}. A relay bridges two families only if its allocation lands in a family both ` +
+        'ends can reach, which nothing here checks; failing that, both ends need a network where ' +
+        'they have a family in common.');
     }
 
     // Ranked, not decided, and the ranking is the point: a NAT that maps per destination and
@@ -768,9 +972,15 @@ async function explainFailure(): Promise<void> {
           : '') +
         'Two readings fit and getStats cannot separate them: a ' +
         'NAT that maps per destination (symmetric), which mobile carriers commonly run, or a ' +
-        'firewall that drops inbound UDP. Neither is beaten by STUN alone — a TURN relay is what ' +
-        'is missing, and this demo deliberately has none. The workaround that needs no relay is to ' +
-        'put both devices on the same network.');
+        'firewall that drops inbound UDP. Neither is beaten by STUN alone — ' +
+        // The lead-in flips on whether a relay exists, because "a relay is what is missing, and one
+        // is configured here" contradicts itself in the same sentence. Only the first branch is
+        // asserted (post-mortem.spec.ts), and only the first branch can run without a relay.
+        (relays.length === 0
+          ? `a TURN relay is what is missing, and ${relayAdvice}`
+          : `a TURN relay is what beats both, and ${relayAdvice} — the relay findings above say ` +
+            'what became of it') +
+        '. The workaround that needs no relay is to put both devices on the same network.');
     }
 
     // Gated on what happened to the PEER'S candidates. Two of these conjuncts are newer
@@ -818,7 +1028,7 @@ async function explainFailure(): Promise<void> {
           ' One caveat on the reading that got you here: a single carrier CGNAT reflects two ' +
           'unrelated networks to the SAME public address, so matching local-mapped/remote-mapped ' +
           'is not proof the two devices share a network. If the peer is on cellular, none of the ' +
-          'above applies and what is missing is a relay.'));
+          `above applies and what is missing is a relay — ${relayAdvice}.`));
     }
 
     if (snap.pairs === 0) {
@@ -834,16 +1044,20 @@ async function explainFailure(): Promise<void> {
     // canLeaveLan(), not `srflx === 0`: a side at a routable host address publishes no srflx
     // and is reachable anyway, so the old test called a usable blob a LAN address. Same
     // correction as the LAN ONLY marker, which review noted the post-mortem was repeating.
-    if (!canLeaveLan(local) && !foundAPath) {
-      findings.push('this side never got a server-reflexive candidate of its own and has no routable ' +
-        'host address either, so everything it published was a LAN address — the ice candidate error ' +
-        'lines above say what happened to STUN. A peer that is not on this network had nothing here ' +
-        'to aim at.');
+    // Not under Force relay. That policy suppresses host and reflexive candidates by design, so
+    // this would report the knob working as a network fault -- a verdict about LAN addresses this
+    // session never published and STUN it never used. Reachable: gatherAndPublish() publishes on a
+    // clean gathering completion with no zero-candidate check on that branch.
+    if (!canLeaveLan(local) && !foundAPath && cfg.iceTransportPolicy !== 'relay') {
+      findings.push('this side never got a server-reflexive candidate of its own, no relay candidate ' +
+        'and no routable host address either, so everything it published was a LAN address — the ice ' +
+        'candidate error lines above say what happened to STUN. A peer that is not on this network ' +
+        'had nothing here to aim at.');
     }
     if (!canLeaveLan(remote) && !foundAPath) {
-      findings.push('the peer published no server-reflexive candidate and no routable host address, ' +
-        'so everything in their blob was a LAN address. If they are not on this network, there was ' +
-        'nothing there to aim at.');
+      findings.push('the peer published no server-reflexive candidate, no relay candidate and no ' +
+        'routable host address, so everything in their blob was a LAN address. If they are not on ' +
+        'this network, there was nothing there to aim at.');
     }
 
     if (iceEverConnected) {
@@ -880,6 +1094,64 @@ async function explainFailure(): Promise<void> {
   }
 }
 
+/**
+ * Which pair actually carried the session, said once, on the success path.
+ *
+ * §8 runs only from connectionState 'failed', so a session that WORKED used to say nothing about
+ * how -- and under the ordinary transport policy there is no other way to tell a relayed path from
+ * a direct one. That distinction is not cosmetic: relaying costs someone bandwidth, and it puts a
+ * third party on the path.
+ *
+ * Degrades rather than guesses. Which stats an engine reports here is not measured in this repo --
+ * no project runs WebKit, and the reported failure this all came from was Safari-to-Safari -- so
+ * when nothing names a selected pair this says so instead of picking one.
+ *
+ * Deliberately does NOT contain the word 'post-mortem': a healthy run asserts that word is absent
+ * from the log.
+ */
+async function reportPath(): Promise<void> {
+  let report: RTCStatsReport;
+  try {
+    report = await pc.getStats();
+  } catch {
+    return; // an engine without getStats() simply says nothing, as §8 does
+  }
+  const byId = new Map<string, Stat>();
+  report.forEach((stat, id) => { byId.set(id, stat as Stat); });
+
+  let pair: Stat | undefined;
+  for (const stat of byId.values()) {
+    if (stat.type === 'transport' && typeof stat.selectedCandidatePairId === 'string') {
+      pair = byId.get(stat.selectedCandidatePairId);
+    }
+  }
+  // Fallback for engines that report no transport row: a nominated or succeeded pair is the same
+  // claim by another route.
+  if (!pair) {
+    for (const stat of byId.values()) {
+      if (stat.type === 'candidate-pair' && (stat.nominated === true || stat.state === 'succeeded')) {
+        pair = stat;
+        break;
+      }
+    }
+  }
+  if (!pair) {
+    log('event', 'path — not knowable from here: this engine reported no selected candidate pair, '
+      + 'so whether this session is relayed cannot be read off getStats()');
+    return;
+  }
+
+  const local = byId.get(String(pair.localCandidateId));
+  const remote = byId.get(String(pair.remoteCandidateId));
+  const url = typeof local?.url === 'string' ? ` via ${local.url}` : '';
+  log('event', `path — ${String(local?.candidateType ?? '?')} ↔ ${String(remote?.candidateType ?? '?')}${url}`);
+  if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') {
+    log('event', 'this session is going through the relay, which sees both endpoints and the timing '
+      + 'and volume of what you send — not its contents. If a direct path would do, Force relay is '
+      + 'what suppresses it; turn it off and redo the exchange to find out whether one exists.');
+  }
+}
+
 // ── §9 the data channel ────────────────────────────────────────────────────
 
 function attach(channel: RTCDataChannel): void {
@@ -889,6 +1161,7 @@ function attach(channel: RTCDataChannel): void {
     everOpen = true; // latched for §8: what fails after this is not a handshake failure
     setPhase('connected'); // the ONLY place 'connected' is written
     log('event', `channel "${channel.label}" open`);
+    void reportPath();
   });
 
   channel.addEventListener('close', () => {
@@ -960,9 +1233,14 @@ function setPhase(next: Phase): void {
 function render(): void {
   ui.role.textContent = role ? `you are the ${role.toUpperCase()}` : 'no role yet';
   ui.phase.textContent = phase;
+  const cfg = applied();
   ui.diag.textContent = [
     location.origin,
     `secure:${window.isSecureContext}`,
+    // Read from the engine, not from the parser: a forced-relay session that looked like a normal
+    // one would silently change what every other reading on this page means.
+    `relay:${relayUrls(cfg).length}`,
+    ...(cfg.iceTransportPolicy === 'relay' ? ['policy:relay'] : []),
     `sig:${pc.signalingState}`,
     `gathering:${pc.iceGatheringState}`,
     `ice:${pc.iceConnectionState}`,
@@ -1040,7 +1318,7 @@ async function copyBlob(): Promise<void> {
   if (window.isSecureContext && navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(text);
-      flashCopy('Copied');
+      flash(ui.copy, 'Copied', 'Copy');
       return;
     } catch {
       // Fall through to the selection fallback.
@@ -1049,12 +1327,95 @@ async function copyBlob(): Promise<void> {
   ui.localBlob.focus();
   ui.localBlob.setSelectionRange(0, text.length);
   const ok = document.execCommand('copy');
-  flashCopy(ok ? 'Copied' : 'Press ⌘/Ctrl+C');
+  flash(ui.copy, ok ? 'Copied' : 'Press ⌘/Ctrl+C', 'Copy');
 }
 
-function flashCopy(label: string): void {
-  ui.copy.textContent = label;
-  setTimeout(() => { ui.copy.textContent = 'Copy'; }, 1400);
+/** Second caller arrived with the invite link, so the button is a parameter now. */
+function flash(button: HTMLButtonElement, label: string, idle: string): void {
+  button.textContent = label;
+  setTimeout(() => { button.textContent = idle; }, 1400);
+}
+
+// ── §12 the ICE server panel ───────────────────────────────────────────────
+
+/**
+ * The panel writes the URL fragment and reloads; it never reconfigures a live pc. That is not a
+ * shortcut -- pc is built at module scope and captured by every listener, so a reload is what
+ * applying a configuration MEANS here, and it keeps the URL bar honest about what the connection
+ * was actually built with.
+ */
+function renderIcePanel(): void {
+  const cfg = applied();
+  const hosts = relayHosts(cfg);
+  ui.iceStatus.textContent = hosts.length > 0
+    ? `relay via ${hosts.join(', ')}${cfg.iceTransportPolicy === 'relay' ? ' · FORCE RELAY' : ''}`
+    : 'built-in STUN, no relay';
+  // Prefilled from what is RUNNING, so the built-in STUN server is visible and gets carried into
+  // the link on purpose rather than smuggled into it. The link is then what runs, which is the
+  // whole reason this fragment is readable instead of encoded.
+  ui.iceUrls.value = iceUrls(cfg).join('\n');
+  // The RELAY entry, found by its URLs rather than by having a username: getConfiguration()
+  // reports `username: ''` on a STUN entry, which is a string, so looking for one that had a
+  // username picked the STUN server and left the boxes empty beside a working relay. Empty boxes
+  // there read as "no credentials configured" -- and pressing Apply would then have stripped them.
+  const relaySrv = (cfg.iceServers ?? []).find((srv) =>
+    (typeof srv.urls === 'string' ? [srv.urls] : srv.urls).some((u) => /^turns?:/i.test(u)));
+  ui.iceUsername.value = relaySrv?.username ?? '';
+  ui.iceCredential.value = typeof relaySrv?.credential === 'string' ? relaySrv.credential : '';
+  ui.iceRelayOnly.checked = cfg.iceTransportPolicy === 'relay';
+  // Open when the configuration arrived from a link: a tab running a relay someone else chose must
+  // not look like a default one.
+  if (ice.source === 'link') ui.iceCard.open = true;
+}
+
+function currentPanelFragment(): string {
+  return buildFragment({
+    urls: ui.iceUrls.value.split('\n').map((u) => u.trim()).filter(Boolean),
+    username: ui.iceUsername.value.trim(),
+    credential: ui.iceCredential.value.trim(),
+    relayOnly: ui.iceRelayOnly.checked,
+  });
+}
+
+function applyIce(): void {
+  // A reload discards a handshake in progress, and the operator reaching for this panel is usually
+  // on their SECOND attempt -- with a blob already on screen.
+  const inFlight = ui.localBlob.value !== '' || ui.remoteBlob.value !== '';
+  if (inFlight && !window.confirm(
+    'Applying reloads this tab and discards the blobs on screen. Session descriptions are '
+    + 'single-use, so you will need to redo the exchange from scratch in both tabs. Continue?')) {
+    return;
+  }
+  const fragment = currentPanelFragment();
+  // replace(), not assign(): the configuration that just failed is not a page worth going Back to.
+  location.replace(`${location.pathname}${location.search}${fragment}`);
+  // Same-document when only the fragment changed, so nothing would re-read it without this.
+  location.reload();
+}
+
+async function copyInviteLink(): Promise<void> {
+  // location.href, never a rebuilt URL: Apply wrote the fragment, so the link and the running page
+  // cannot diverge -- which is also what keeps the Pages sub-path right with nothing to get wrong.
+  const link = location.href;
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(link);
+      flash(ui.iceLink, 'Copied', 'Copy invite link');
+      return;
+    } catch {
+      // Fall through to the same selection fallback the blob uses.
+    }
+  }
+  // No dedicated field for this: the URL list doubles as the selection surface, the same way the
+  // blob textarea does for copyBlob().
+  ui.iceUrls.value = link;
+  ui.iceUrls.focus();
+  ui.iceUrls.setSelectionRange(0, link.length);
+  const ok = document.execCommand('copy');
+  flash(ui.iceLink, ok ? 'Copied' : 'Press ⌘/Ctrl+C', 'Copy invite link');
+  // Only when it worked. Restoring the list under a "Press ⌘/Ctrl+C" prompt would delete the very
+  // thing the operator was just told to copy.
+  if (ok) renderIcePanel();
 }
 
 // ── wiring ─────────────────────────────────────────────────────────────────
@@ -1070,6 +1431,8 @@ ui.accept.addEventListener('click', () => {
 });
 
 ui.copy.addEventListener('click', () => { void copyBlob(); });
+ui.iceApply.addEventListener('click', applyIce);
+ui.iceLink.addEventListener('click', () => { void copyInviteLink(); });
 ui.reset.addEventListener('click', () => { location.reload(); });
 ui.send.addEventListener('click', submit);
 ui.compose.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') submit(); });
@@ -1081,5 +1444,8 @@ function submit(): void {
   ui.compose.value = '';
 }
 
+renderIcePanel();
 render();
+// Before 'ready', because the configuration is the first thing that happened to pc.
+for (const note of ice.notes) log('event', note);
 log('event', 'ready — pick a role: create an offer, or paste one you were sent');

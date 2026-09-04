@@ -45,7 +45,15 @@
     /* 16px: below this, iOS Safari zooms on focus and the operator loses the page. */
     font-size: 16px; resize: vertical;
   }
+  /* index.html's `textarea, input` rule sets width:100%, which would stretch a checkbox across
+     the whole panel. This is the one rule here that is not cosmetic. */
+  input[type="checkbox"] { width: auto; }
   .row { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+  details#ice-card > summary { cursor: pointer; font-size: 12px; color: var(--dim); }
+  details#ice-card > summary #ice-status { color: var(--text); }
+  details#ice-card label { display: block; font-size: 11px; color: var(--dim); margin: 8px 0 3px; }
+  details#ice-card label.check { display: flex; align-items: center; gap: 7px; margin: 0; font-size: 12px; }
+  .fine { font-size: 11px; color: var(--dim); margin: 10px 0 0; max-width: 58ch; }
   #blob-meta { font-family: var(--mono); font-size: 11px; color: var(--dim); }
   .error { color: var(--warn); min-height: 1.5em; margin: 8px 0 0; }
   ol#wire-log {
@@ -88,6 +96,39 @@
       WebRTC never says how these blobs reach the other peer. Normally a signaling
       server carries them. Here, you do.
     </p>
+    <details class="card" id="ice-card" data-testid="ice-panel">
+      <summary>ICE servers — <span id="ice-status" data-testid="ice-status">built-in STUN, no relay</span></summary>
+      <p class="fine">
+        STUN alone does not beat a NAT that maps per destination, which mobile carriers commonly run.
+        A relay (TURN) does. This demo ships none and no credentials — bring your own; the README's
+        “Getting a relay” names free, paid and self-hosted options.
+      </p>
+      <label for="ice-urls">ICE server URLs, one per line</label>
+      <textarea id="ice-urls" data-testid="ice-urls" rows="3" spellcheck="false"
+                autocapitalize="off" autocorrect="off"></textarea>
+      <label for="ice-username">Relay username</label>
+      <input id="ice-username" data-testid="ice-username" autocomplete="off" spellcheck="false"
+             autocapitalize="off" autocorrect="off">
+      <label for="ice-credential">Relay credential</label>
+      <input id="ice-credential" data-testid="ice-credential" autocomplete="off" spellcheck="false"
+             autocapitalize="off" autocorrect="off">
+      <div class="row">
+        <label class="check"><input type="checkbox" id="ice-relay-only" data-testid="ice-relay-only">
+          Force relay — gathers nothing but relayed candidates, so connecting proves the relay</label>
+      </div>
+      <div class="row">
+        <button id="ice-apply" data-testid="ice-apply">Apply</button>
+        <button id="ice-link" data-testid="ice-link">Copy invite link</button>
+      </div>
+      <p class="fine">
+        Applied at load. Change this, press Apply — the page reloads — and redo the exchange from
+        scratch in both tabs; session descriptions are single-use. The invite link carries these
+        credentials in its fragment, so it is not for public posting, and whoever opens it relays
+        through the server named above. A relay sees DTLS-encrypted bytes, plus both endpoints'
+        addresses and the timing and volume of traffic — not what you type. It cannot substitute a
+        DTLS fingerprint either: that rides in the blob you carry by hand.
+      </p>
+    </details>
     <div>
       <button id="create-offer" data-testid="create-offer">Start as OFFERER — create offer</button>
     </div>

@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { DEAD_STUN, installPc, IP_HOST6, SRFLX, UDP_HOST } from './pc';
+import { DEAD_STUN, DEAD_TURN, installPc, IP_HOST6, RELAY, SRFLX, UDP_HOST } from './pc';
 
 // Whether the blob you are about to copy can leave this LAN at all, said BEFORE you
 // copy it rather than after the exchange fails.
@@ -83,4 +83,55 @@ test('a blob whose only candidate is a routable host address is not marked LAN O
   await expect(page.getByTestId('blob-meta')).toContainText('1 candidate (1 host)');
   await expect(page.getByTestId('blob-meta')).not.toContainText('LAN ONLY');
   await expect(page.getByTestId('wire-log')).not.toContainText('can only reach a peer on this network');
+});
+
+test('a blob whose candidates include a relay is not marked LAN ONLY', async ({ page }) => {
+  // A relayed address is reachable from off this network by construction, so canLeaveLan() has
+  // always counted it -- the term was written for the reading rather than for the branch, and the
+  // branch has now arrived. This is the guard that it kept working once it could actually fire.
+  await installPc(page, { config: { iceServers: [] }, localCandidates: [UDP_HOST, RELAY] });
+  await page.goto('/');
+  await page.getByTestId('create-offer').click();
+
+  await expect(page.getByTestId('signal-phase')).toHaveText('offer-ready');
+  expect(await page.getByTestId('local-blob').inputValue()).not.toMatch(/typ srflx/);
+  // The count comes free from the type summary; no marker restates it.
+  await expect(page.getByTestId('blob-meta')).toContainText('1 relay');
+  await expect(page.getByTestId('blob-meta')).not.toContainText('LAN ONLY');
+  await expect(page.getByTestId('blob-meta')).not.toContainText('NO RELAY');
+});
+
+test('a relay that produced no candidate is called out BEFORE the blob is copied', async ({ page }) => {
+  // The failure shape this marker exists for, and it is the one the reported bug would have hit
+  // next: with a server-reflexive candidate present canLeaveLan() is already true, so nothing was
+  // said -- the operator configures a relay, the allocation fails or lands late, and they copy a
+  // clean-looking blob guaranteed to fail in exactly the way the relay was configured to fix.
+  //
+  // The TURN server is routed nowhere (TEST-NET-2), so getConfiguration() reports a relay while
+  // zero relay candidates are gathered. Host candidates still arrive, so the blob is publishable.
+  await installPc(page, {
+    config: { iceServers: [DEAD_TURN] },
+    localCandidates: [UDP_HOST, SRFLX('198.51.100.7')],
+  });
+  await page.goto('/');
+  await page.getByTestId('create-offer').click();
+
+  // While gathering is still running the relay may be seconds away, so the marker says wait.
+  await expect(page.getByTestId('signal-phase')).toHaveText('offer-ready');
+  await expect(page.getByTestId('blob-meta')).toContainText('PARTIAL');
+  await expect(page.getByTestId('blob-meta')).not.toContainText('NO RELAY');
+
+  // Synthesized rather than waiting out ~40 s of libwebrtc back-off: the app reads only
+  // pc.iceGatheringState, so a stubbed getter plus the event is the same thing at the call site.
+  await page.evaluate(() => {
+    const pc = (window as unknown as Record<string, unknown>).__pc as RTCPeerConnection;
+    Object.defineProperty(pc, 'iceGatheringState', { get: () => 'complete', configurable: true });
+    pc.dispatchEvent(new Event('icegatheringstatechange'));
+  });
+
+  await expect(page.getByTestId('blob-meta')).not.toContainText('PARTIAL');
+  await expect(page.getByTestId('blob-meta')).toContainText('NO RELAY');
+  // A warning about a blob that is still worth copying to a peer STUN can reach, never an error.
+  await expect(page.getByTestId('error')).toHaveText('');
+  await expect(page.getByTestId('blob-meta')).not.toContainText('LAN ONLY');
 });

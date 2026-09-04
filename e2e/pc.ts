@@ -10,7 +10,12 @@ import type { Page } from '@playwright/test';
 export type Fixture = [string, Record<string, unknown>][];
 
 export interface PcOptions {
-  /** Merged field-by-field over the RTCConfiguration src/main.ts passes. */
+  /**
+   * Spread over the RTCConfiguration src/main.ts passes -- at the TOP LEVEL, so an `iceServers`
+   * here REPLACES the app's array rather than merging with it. That is the point: it hands the
+   * browser a configuration the app never parsed, which is how a test drives the real
+   * getConfiguration() independently of the app's own reading of location.hash.
+   */
   config?: RTCConfiguration;
   /** Serve getStats() from these rows instead of the real report. */
   stats?: Fixture;
@@ -18,6 +23,13 @@ export interface PcOptions {
   localCandidates?: string[];
   /** ADD these a=candidate lines to the ones the app reads back. */
   extraLocalCandidates?: string[];
+  /**
+   * Make the FIRST construction throw with this message, and only the first. src/main.ts builds pc
+   * at module scope, so a throw there registers no listener and renders nothing -- the app catches
+   * it and rebuilds with the default config, and that second construction has to succeed or the
+   * test measures the fallback failing rather than the fallback working.
+   */
+  throwOnce?: string;
 }
 
 /**
@@ -56,8 +68,13 @@ export async function installPc(page: Page, opts: PcOptions = {}): Promise<void>
       return out.join('\r\n');
     };
 
+    let thrown = false;
+
     window.RTCPeerConnection = class extends Orig {
       constructor(cfg?: RTCConfiguration) {
+        // Before super(), which is legal so long as `this` is not touched -- and it is what makes
+        // this indistinguishable from the engine refusing the configuration outright.
+        if (o.throwOnce !== undefined && !thrown) { thrown = true; throw new TypeError(o.throwOnce); }
         super({ ...cfg, ...(o.config ?? {}) });
         (window as unknown as Record<string, unknown>).__pc = this;
 
@@ -113,3 +130,23 @@ export const SRFLX = (addr: string): string =>
   `a=candidate:5 1 udp 1677729534 ${addr} 50004 typ srflx raddr 0.0.0.0 rport 0 generation 0 network-cost 999`;
 export const SRFLX6 = (addr: string): string =>
   `a=candidate:6 1 udp 1677729533 ${addr} 50005 typ srflx raddr :: rport 0 generation 0 network-cost 999`;
+/**
+ * A relay candidate: field [4] is the address the TURN server ALLOCATED, which is why it is a
+ * routable literal here and the base in raddr is not. Nothing in countCandidates() reads raddr --
+ * it reads the transport (field 2) and the address (field 4) and nothing else -- so no assertion in
+ * this suite depends on it, and the value below is shaped rather than measured.
+ *
+ * Writing this line allocates nothing. It is a string in an SDP the app READS, and no test in this
+ * repo reaches a TURN server that answers -- the only turn: URLs here are routed nowhere -- so
+ * none of them can show that relaying works.
+ */
+export const RELAY =
+  'a=candidate:8 1 udp 41885439 198.51.100.1 50007 typ relay raddr 192.0.2.1 rport 50002 generation 0 network-cost 999';
+/**
+ * A TURN server at a routed-nowhere address (TEST-NET-2, RFC 5737): the ALLOCATION never completes,
+ * so `getConfiguration()` reports a relay is configured while zero relay candidates are gathered.
+ * That is the shape the NO RELAY marker and the first new post-mortem finding are both about.
+ */
+export const DEAD_TURN: RTCIceServer = {
+  urls: 'turn:198.51.100.1:3478', username: 'u', credential: 'p',
+};
