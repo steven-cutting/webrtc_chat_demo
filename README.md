@@ -9,9 +9,11 @@ There is no signaling server. **You** are the signaling channel: you copy one JS
 blob from tab A into tab B, and the answer back.
 
 **Live: <https://stevencutting.com/webrtc_chat_demo/>** — two tabs, nothing to install.
-Static hosting, so there is still no server in the loop. A public URL buys reach it cannot
-deliver, though: there is no TURN here, so two people on *different* networks will still
-fail to connect (§5 below). Same LAN, or two tabs on one machine.
+Static hosting, so there is still no *signaling* server — one STUN server is in the loop,
+as §5 and the diagram below say. A public URL buys less reach than it looks like: there is
+no TURN here, so no relay fallback, and whether two people on *different* networks connect
+depends on the NAT at each end (§5). Nothing in this repo measures that case. Same LAN, or
+two tabs on one machine, is what is actually exercised.
 
 To run it locally instead:
 
@@ -28,8 +30,9 @@ into the first and click **Accept answer**. Both tabs show `channel:open`. Type.
 | --- | --- |
 | `npm run dev` | Vite on `0.0.0.0:5173` (`--strictPort`, so a port collision is loud) |
 | `npm run typecheck` | `tsc --noEmit` over `src/`, `e2e/`, `playwright.config.ts`, `vite.config.ts` |
-| `npm run test:e2e` | Playwright, two projects (bundled Chromium, and Google Chrome via `channel`) on **stock launch args**, so mDNS obfuscation stays on: `handshake.spec.ts` runs the full two-context handshake and asserts byte-identity both ways; `ice-timeout.spec.ts` drives the gathering-timeout path against a black-holed STUN/TURN address; `post-mortem.spec.ts` covers the failure diagnosis in §8, six of its seven tests from a stats fixture rather than a real 15 s timeout; `answerer-clock.spec.ts` measures the no-deadline claim with a deliberate 20 s stall (~1 min 45 s total; the chromium-only tests carry the deliberate waits). Add `--project=chromium` if Chrome is not installed |
+| `npm run test:e2e` | Playwright. Two dev-server projects (bundled Chromium, and Google Chrome via `channel`) on **stock launch args**, so mDNS obfuscation stays on: `handshake.spec.ts` runs the full two-context handshake and asserts byte-identity both ways; `ice-timeout.spec.ts` drives the gathering-timeout path against a black-holed STUN/TURN address; `post-mortem.spec.ts` covers the failure diagnosis in §8, six of its seven tests from a stats fixture rather than a real 15 s timeout; `answerer-clock.spec.ts` measures the no-deadline claim with a deliberate 20 s stall (~1 min 45 s total; the chromium-only tests carry the deliberate waits). A third project, **`pages-build`**, is the only one that runs against the *built* bundle under `/webrtc_chat_demo/` rather than the dev server: `pages-build.spec.ts` fails on any response ≥ 400 while loading it, and `handshake.spec.ts` runs there too. That project is the CI gate. Add `--project=chromium` if Chrome is not installed |
 | `npm run build` | Production bundle into `dist/` — exactly what GitHub Pages serves |
+| `npm run preview:pages` | Builds, then serves `dist/` at `http://127.0.0.1:4173/webrtc_chat_demo/` — the Pages layout, reproduced locally. The `pages-build` project's server |
 
 ## The handshake
 
@@ -83,9 +86,11 @@ into the first and click **Accept answer**. Both tabs show `channel:open`. Type.
    and DTLS finished; SCTP/DCEP still has to complete, and `dc.send()` in that window
    throws `InvalidStateError`. The only true readiness signal is
    `dc.readyState === 'open'`.
-5. **No TURN, so no NAT traversal.** On a LAN this connects host↔host. Over the open
-   internet, or behind strict/symmetric NAT, it will not — and that is out of scope
-   rather than half-implemented.
+5. **No TURN, so no relay fallback.** STUN still runs, and its `srflx` candidates do
+   traverse many NATs — so "no TURN" is not "no NAT traversal". What is missing is the
+   last resort: behind symmetric NAT, or a firewall that drops UDP, there is no direct
+   path, and with TURN out of scope nothing here can build one. On a LAN this connects
+   host↔host, which is the only case this repo measures.
 
 ## Across devices
 

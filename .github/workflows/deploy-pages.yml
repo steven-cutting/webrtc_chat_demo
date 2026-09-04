@@ -1,10 +1,19 @@
 # Builds the demo and publishes it to GitHub Pages.
 #
-# The gate is typecheck + build, not the Playwright suite: that suite needs a browser
-# install and spends ~1 min 45 s on deliberate waits, and what it covers -- the ICE
-# handshake -- cannot fail from a change that typechecks and bundles. It stays a local
-# check. `pull_request` runs the same gate on the PR, with the deploy job skipped, so a
-# change to this file is exercised before it can publish anything.
+# The gate is typecheck + build + one Playwright project (`pages-build`) run against the
+# BUILT bundle served at `/webrtc_chat_demo/` -- not the full suite. That project is the
+# only check here that can fail on behaviour: it asserts nothing 404s under the subpath
+# (the failure mode `base: './'` risks) and drives the whole handshake to byte-identity.
+# Typecheck and build alone cannot do that -- a logic change that breaks the handshake
+# still typechecks and bundles.
+#
+# What is still local-only: the three chromium-only specs -- ice-timeout, post-mortem,
+# answerer-clock -- which spend ~1 min 45 s on deliberate waits.
+#
+# `pull_request` runs the same gate on the PR with the deploy job skipped, so a change to
+# this file is exercised before it can publish anything. Note what that leaves unexercised:
+# the deploy job never runs on a PR, so its permissions and concurrency group are proven
+# only by a push to main.
 name: Deploy to Pages
 
 on:
@@ -14,16 +23,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Workflow-wide is the floor, and the floor is read-only: `build` checks out PR-authored
+# code and runs its npm lifecycle scripts, so it must not hold deployment credentials.
+# pages/id-token live on `deploy` alone.
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-# Never let two deploys interleave. cancel-in-progress stays false so an in-flight
-# publish finishes rather than leaving the site half-updated.
-concurrency:
-  group: pages
-  cancel-in-progress: false
 
 jobs:
   build:
@@ -42,6 +46,12 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
+      # chromium only, and only the one project: the browser install is the expensive
+      # part (~1 min), the tests themselves are seconds. `pages-build` rebuilds via its
+      # own webServer, so it tests a bundle it produced, not the one above.
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test --project=pages-build
+
       # path is REQUIRED and defaults to _site/; vite builds to dist/.
       - uses: actions/upload-pages-artifact@v5
         with:
@@ -51,6 +61,23 @@ jobs:
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+
+    # actions/deploy-pages needs exactly these two. It does not check out, so no
+    # contents: read. A job-level block REPLACES the workflow-level one.
+    permissions:
+      pages: write
+      id-token: write
+
+    # Scoped to this job, not the workflow: a workflow-wide group would put PR builds and
+    # main-branch deploys in one queue, and GitHub keeps at most one PENDING member per
+    # group -- a later PR event would evict a pending deploy, regardless of
+    # cancel-in-progress. A job skipped by `if:` never acquires the group, so PR runs stay
+    # out of it. cancel-in-progress stays false so an in-flight publish finishes rather
+    # than leaving the site half-updated.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

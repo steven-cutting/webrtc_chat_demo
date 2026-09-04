@@ -26,8 +26,13 @@ test('typed JSON envelopes cross the data channel, byte for byte', async ({ brow
   const B = await ctxB.newPage();
   watch(A, 'A');
   watch(B, 'B');
-  await A.goto('/');
-  await B.goto('/');
+  // './' and not '/'. Playwright resolves against baseURL with `new URL()`, so '/' means
+  // the ORIGIN root -- which drops the subpath in the `pages-build` project, where
+  // baseURL is http://127.0.0.1:4173/webrtc_chat_demo/. './' is identical for the dev
+  // projects and correct for both, which is what lets this spec run against the built
+  // bundle as well as the dev server.
+  await A.goto('./');
+  await B.goto('./');
 
   // 1. Offerer role, and the non-trickle gate. Reading the blob before
   //    'offer-ready' races and copies a candidate-less SDP that still connects
