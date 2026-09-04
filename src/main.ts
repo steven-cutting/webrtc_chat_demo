@@ -333,6 +333,9 @@ function publish(): void {
   if (c.mdns) {
     log('event', 'host candidates are mDNS-obfuscated — the peer must resolve them over multicast DNS');
   }
+  if (!provisional && c.srflx === 0) {
+    log('event', 'no server-reflexive candidate — this blob can only reach a peer on this network');
+  }
   render();
 }
 
@@ -344,8 +347,29 @@ function publish(): void {
 function renderBlobMeta(): void {
   const blob = ui.localBlob.value;
   const c = countCandidates(pc.localDescription?.sdp ?? '');
-  const partial = provisional ? ' · PARTIAL — still gathering, copy again when this clears' : '';
-  ui.blobMeta.textContent = `${blob.length.toLocaleString()} chars · ${c.summary}${partial}`;
+  ui.blobMeta.textContent = `${blob.length.toLocaleString()} chars · ${c.summary}${reachMarker(c)}`;
+}
+
+/**
+ * Whether this blob can leave the LAN, said where the operator is looking when they decide
+ * to copy it. A description with no srflx candidate is not broken -- host↔host on one
+ * network is the case this repo actually measures -- but it is unusable against a peer
+ * anywhere else, and finding that out cost a hand-delivered blob and a 15 s ICE timeout.
+ *
+ * A warning and never an error: LAN-only is a supported mode, so this must not reach
+ * ui.error, which a healthy run asserts is empty. The two zero cases are kept apart
+ * because the actions differ -- under PARTIAL the candidate may still be seconds away,
+ * and calling that blob LAN-only would be a verdict on a set that is not final yet.
+ */
+function reachMarker(c: Candidates): string {
+  if (provisional) {
+    return c.srflx === 0
+      ? ' · PARTIAL — still gathering, no server-reflexive candidate yet, copy again when this clears'
+      : ' · PARTIAL — still gathering, copy again when this clears';
+  }
+  return c.srflx === 0
+    ? ' · LAN ONLY — no server-reflexive candidate, so this blob can only reach a peer on this network'
+    : '';
 }
 
 interface Candidates {
@@ -358,6 +382,17 @@ interface Candidates {
   mdnsHosts: number;
   /** `typ host` lines carried over UDP -- the only ones that can ever pair. */
   udpHosts: number;
+  /** `typ srflx` lines -- whether anything here can leave this LAN at all. */
+  srflx: number;
+  /**
+   * The mapped addresses of those lines: this side as the STUN server saw it. Two ends
+   * whose sets intersect are behind one NAT; two whose sets are disjoint are on different
+   * networks. That comparison is the only thing separating a broken multicast stack from
+   * a cross-network attempt, and getStats() cannot make it -- see §8.
+   */
+  srflxAddresses: string[];
+  /** The families of those addresses. Disjoint families cannot pair, whatever the NAT does. */
+  srflxFamilies: Set<'v4' | 'v6'>;
 }
 
 /** Read-only: counts a=candidate lines. Never modifies the SDP. */
@@ -367,6 +402,9 @@ function countCandidates(sdp: string): Candidates {
   let mdns = false;
   let mdnsHosts = 0;
   let udpHosts = 0;
+  let srflx = 0;
+  const srflxAddresses: string[] = [];
+  const srflxFamilies = new Set<'v4' | 'v6'>();
   for (const line of lines) {
     const m = /\btyp (\w+)\b/.exec(line);
     if (m) byType.set(m[1], (byType.get(m[1]) ?? 0) + 1);
@@ -379,9 +417,18 @@ function countCandidates(sdp: string): Candidates {
       if (address?.endsWith('.local')) mdnsHosts++;
       if (transport === 'udp') udpHosts++;
     }
+    // Field [4] of a srflx line is the MAPPED address, not the local one -- the local one
+    // is in raddr further along. `relay` is deliberately absent: with no TURN configured
+    // nothing here can produce one, and counting a type that cannot occur would be an
+    // abstraction ahead of a use.
+    if (m?.[1] === 'srflx' && address) {
+      srflx++;
+      if (!srflxAddresses.includes(address)) srflxAddresses.push(address);
+      srflxFamilies.add(address.includes(':') ? 'v6' : 'v4');
+    }
   }
   const total = lines.length;
-  const base = { total, mdns, byType, mdnsHosts, udpHosts };
+  const base = { total, mdns, byType, mdnsHosts, udpHosts, srflx, srflxAddresses, srflxFamilies };
   if (total === 0) return { ...base, summary: 'no candidates' };
   const parts = [...byType].map(([t, n]) => `${n} ${t}`).join(', ');
   // No ' via <server>' here. This function sees only the SDP, which carries no
@@ -524,14 +571,41 @@ async function explainFailure(): Promise<void> {
     const remote = countCandidates(pc.currentRemoteDescription?.sdp ?? '');
     const local = countCandidates(pc.localDescription?.sdp ?? '');
 
+    // The comparison getStats() cannot make. A .local name that never became a pair looks
+    // identical whether multicast is broken on one LAN or the peer is simply somewhere
+    // else -- across the internet a .local name CANNOT resolve, so that zero is the
+    // expected reading of a cross-network attempt rather than evidence of a fault. What
+    // separates the two is whether the two ends were reflected to the same public address,
+    // and that is in the SDPs, not in the stats report.
+    //
+    // Both sets must be non-empty for the question to mean anything. With one side at zero
+    // the reading is 'unknown' and every verdict below falls back to what it said before.
+    const bothReflexive = local.srflx > 0 && remote.srflx > 0;
+    const shared = local.srflxAddresses.filter((a) => remote.srflxAddresses.includes(a));
+    const differentNetworks = bothReflexive && shared.length === 0;
+    // A strictly stronger reading of the same evidence: no NAT behaviour can make a v4
+    // candidate pair with a v6 one, so this is arithmetic rather than a suspicion. Known
+    // gap, and it belongs to differentNetworks alone: a v6-only pair on ONE LAN also shares
+    // no address, and reads as 'different'.
+    const familySplit = bothReflexive
+      && [...local.srflxFamilies].every((f) => !remote.srflxFamilies.has(f));
+    const nets = bothReflexive ? (differentNetworks ? 'different' : 'same') : 'unknown';
+
     // Evidence before verdicts, and printed whether or not a verdict fires -- so a
     // branch that did NOT fire is still visible to whoever reads the log next.
     log('event',
       `post-mortem — pairs:${snap.pairs} udp-host-pairs:${snap.udpHostPairs} ` +
       `remote-hosts:${snap.remoteHosts} mdns-offered:${remote.mdnsHosts} ` +
-      `local-udp-hosts:${local.udpHosts} sent:${snap.requestsSent} ` +
+      `local-udp-hosts:${local.udpHosts} ` +
+      `local-srflx:${local.srflx} remote-srflx:${remote.srflx} nets:${nets} ` +
+      `sent:${snap.requestsSent} ` +
       `recv:${snap.requestsReceived} answered:${snap.responsesReceived}` +
-      (snap.stunUrls.length ? ` stun:${snap.stunUrls.join(',')}` : ''));
+      (snap.stunUrls.length ? ` stun:${snap.stunUrls.join(',')}` : '') +
+      // Public addresses, and the only place they are printed. The verdicts below say
+      // "different public addresses" and leave the values here, so a log pasted into a bug
+      // report can be redacted at one line rather than mid-sentence.
+      (local.srflxAddresses.length ? ` local-mapped:${local.srflxAddresses.join(',')}` : '') +
+      (remote.srflxAddresses.length ? ` remote-mapped:${remote.srflxAddresses.join(',')}` : ''));
 
     // Said alone and first, because none of the findings below apply to it: they are all
     // about a handshake that never completed, and this session completed one. It is also
@@ -555,6 +629,38 @@ async function explainFailure(): Promise<void> {
     // connection ICE did complete.
     const foundAPath = iceEverConnected || snap.succeeded > 0;
 
+    // Provable, so it leads when it holds: with no family in common there is no address
+    // the two ends share, and the absent pair follows from that alone. !foundAPath for the
+    // same reason as everything below -- a dual-stack pair that connected host↔host on one
+    // LAN can still have disjoint srflx families, and that is not a failure.
+    if (familySplit && !foundAPath) {
+      const here = local.srflxFamilies.has('v4') ? 'IPv4' : 'IPv6';
+      const there = here === 'IPv4' ? 'IPv6' : 'IPv4';
+      findings.push(
+        `this side published only ${here} server-reflexive candidates and the peer only ${there}. ` +
+        'There is no address the two ends share, so no candidate pair could exist — this is not a ' +
+        'NAT to be traversed, it is two disjoint address families. Only a relay bridges those, and ' +
+        'this demo has none; without one, both ends need a network where they have a family in common.');
+    }
+
+    // Ranked, not decided, and the ranking is the point: a NAT that maps per destination and
+    // a firewall that drops inbound UDP are indistinguishable from here. The check counts are
+    // in the text rather than in the gate, so a cross-network failure that happened to get one
+    // response back still gets this verdict instead of falling through to the mDNS one.
+    if (differentNetworks && !foundAPath) {
+      const sent = snap.requestsSent;
+      findings.push(
+        'the two ends have different public addresses, so they are on different networks — the ' +
+        "evidence line above has both. The peer's .local host candidates could never have resolved " +
+        'here, and that zero is expected rather than a fault. What had to work is the ' +
+        `server-reflexive pair: ${sent} connectivity check${sent === 1 ? '' : 's'} went out with ` +
+        `${snap.responsesReceived} answered. Two readings fit and getStats cannot separate them: a ` +
+        'NAT that maps per destination (symmetric), which mobile carriers commonly run, or a ' +
+        'firewall that drops inbound UDP. Neither is beaten by STUN alone — a TURN relay is what ' +
+        'is missing, and this demo deliberately has none. The workaround that needs no relay is to ' +
+        'put both devices on the same network.');
+    }
+
     // Gated on what happened to the PEER'S candidates. Two of these conjuncts are newer
     // than the rest and both can only ever SUPPRESS this finding, never fire it somewhere
     // it did not fire before:
@@ -563,6 +669,13 @@ async function explainFailure(): Promise<void> {
     //     still read 'host', and libwebrtc rewrites that to srflx/prflx on a check whose
     //     mapped address differs, which would drop a pair mDNS had demonstrably built.
     //   !foundAPath -- see above.
+    //   !differentNetworks -- the peers are demonstrably not on one network, so their
+    //     .local names were never going to resolve here and this advice is unactionable.
+    //     Its residual gap, which is why local-srflx/remote-srflx are in the evidence line:
+    //     the comparison needs a srflx address from BOTH ends, so a side whose STUN was
+    //     blocked reads 'unknown' and still gets the Local Network headline against an
+    //     off-network peer. The LAN ONLY marker fires on that side before the blob is
+    //     ever copied, which is where that case is meant to be caught.
     // What is deliberately NOT claimed any more is that their names failed to resolve. An
     // unresolved .local name IS discarded rather than added -- P2PTransportChannel::
     // AddRemoteCandidateWithResult returns on a resolver error, so the candidate never
@@ -571,7 +684,7 @@ async function explainFailure(): Promise<void> {
     // nothing here can pair with, an IPv4/IPv6 split being the obvious one, and getStats
     // cannot tell those two apart.
     if (remote.mdnsHosts > 0 && local.udpHosts > 0 && !foundAPath
-        && snap.remoteHosts === 0 && snap.udpHostPairs === 0) {
+        && snap.remoteHosts === 0 && snap.udpHostPairs === 0 && !differentNetworks) {
       findings.push(
         "no candidate pair was ever formed against the peer's .local host candidates. " +
         'The leading suspect is that those names never resolved. Two browsers on ONE machine: ' +
@@ -586,6 +699,20 @@ async function explainFailure(): Promise<void> {
       findings.push('no candidate pair was ever formed, so ICE had nothing to test.');
     } else if (snap.requestsSent > 0 && snap.responsesReceived === 0) {
       findings.push(`${snap.requestsSent} connectivity checks were sent and none came back.`);
+    }
+
+    // Reported, never promoted. On a healthy LAN a peer legitimately has no srflx and
+    // host↔host is the path, so putting either of these ahead of the mDNS finding would take
+    // the headline in exactly the case that finding exists for. The pre-flight LAN ONLY
+    // marker is what covers this, before a blob nothing off-LAN can use has been delivered.
+    if (local.srflx === 0 && !foundAPath) {
+      findings.push('this side never got a server-reflexive candidate of its own, so everything it ' +
+        'published was a LAN address — the ice candidate error lines above say what happened to ' +
+        'STUN. A peer that is not on this network had nothing here to aim at.');
+    }
+    if (remote.srflx === 0 && !foundAPath) {
+      findings.push('the peer published no server-reflexive candidate, so everything in their blob ' +
+        'was a LAN address. If they are not on this network, there was nothing there to aim at.');
     }
 
     if (iceEverConnected) {

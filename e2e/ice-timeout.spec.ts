@@ -1,4 +1,5 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test } from '@playwright/test';
+import { DEAD_STUN, installPc } from './pc';
 
 // The ICE-gathering timeout path in src/main.ts, which handshake.spec.ts never
 // reaches: on a healthy network gathering completes in ~125 ms, roughly 24x
@@ -6,29 +7,13 @@ import { expect, test, type Page } from '@playwright/test';
 // 192.0.2.1 (TEST-NET-1, RFC 5737) -- routed nowhere, so it never answers and
 // Chrome retransmits until it gives up ~40 s later.
 
-/** Re-run the app's own `new RTCPeerConnection(...)` with these fields replaced. */
-async function override(page: Page, overrides: RTCConfiguration): Promise<void> {
-  // addInitScript, so the wrapper is installed before src/main.ts constructs pc.
-  await page.addInitScript((o: RTCConfiguration) => {
-    const Orig = window.RTCPeerConnection;
-    window.RTCPeerConnection = class extends Orig {
-      constructor(cfg?: RTCConfiguration) {
-        super({ ...cfg, ...o });
-        (window as unknown as Record<string, unknown>).__pc = this;
-      }
-    };
-  }, overrides);
-}
-
-const DEAD_STUN: RTCConfiguration = { iceServers: [{ urls: 'stun:192.0.2.1:19302' }] };
-
 test('gathering timeout with candidates: publishes, marks the blob PARTIAL, then refreshes it', async ({ page }) => {
   // Chromium only: this is libwebrtc back-off, identical across channels, and it
   // costs ~45 s -- not worth paying twice.
   test.skip(test.info().project.name !== 'chromium', 'libwebrtc-level behaviour; ~45 s of STUN back-off');
   test.setTimeout(150_000);
 
-  await override(page, DEAD_STUN);
+  await installPc(page, { config: DEAD_STUN });
   await page.goto('/');
   await page.getByTestId('create-offer').click();
 
@@ -49,10 +34,10 @@ test('gathering timeout with candidates: publishes, marks the blob PARTIAL, then
 
 test('gathering timeout with ZERO candidates: refuses to publish an unusable blob', async ({ page }) => {
   // relay-only against a TURN server that never answers: nothing to gather.
-  await override(page, {
+  await installPc(page, { config: {
     iceTransportPolicy: 'relay',
     iceServers: [{ urls: 'turn:192.0.2.1:3478', username: 'x', credential: 'y' }],
-  });
+  } });
   await page.goto('/');
   await page.getByTestId('create-offer').click();
 
@@ -70,7 +55,7 @@ test('a late gathering completion must not reset a session that already connecte
   const B = await ctxB.newPage();
 
   // Only A is starved, so only A arms the refresh listener; B answers normally.
-  await override(A, DEAD_STUN);
+  await installPc(A, { config: DEAD_STUN });
   await A.goto('/');
   await B.goto('/');
 
